@@ -1,0 +1,30 @@
+# Build-only image for scriber-client. Produces the `scriber` binary on the host
+# without requiring Go or gcc to be installed locally.
+#
+# Usage:
+#   docker build -f Dockerfile.build -t scriber-client-build .
+#   docker run --rm -v $PWD/dist:/out scriber-client-build
+#   # binary appears at ./dist/scriber
+#
+# The binary still requires PipeWire/Pulse + tmux + evdev on the *host* at runtime —
+# this is a build helper, not a way to run the client containerized.
+
+FROM golang:1.23-bookworm AS build
+
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        gcc libc6-dev libasound2-dev pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN go mod download
+
+COPY . .
+ENV CGO_ENABLED=1
+RUN go build -trimpath -ldflags="-s -w" -o /out/scriber ./cmd/scriber
+
+# Final stage: minimal scratch + the binary, used as a "copy-out" image.
+FROM scratch
+COPY --from=build /out/scriber /scriber
+ENTRYPOINT ["/bin/cp", "/scriber", "/out/scriber"]

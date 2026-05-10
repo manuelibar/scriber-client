@@ -1,0 +1,8 @@
+/scriber
+/dist/
+/bin/
+.cache/
+.git/
+.gitignore
+README.md
+*.log

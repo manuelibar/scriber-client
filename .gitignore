@@ -1,0 +1,15 @@
+# binaries
+/scriber
+/dist/
+/bin/
+*.exe
+
+# Go caches
+.cache/
+
+# IDE
+.idea/
+.vscode/
+
+# logs
+*.log
