@@ -1,7 +1,9 @@
 package audio
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
 
 	"github.com/gen2brain/malgo"
@@ -21,6 +23,7 @@ type Capture struct {
 	device    *malgo.Device
 	buf       []byte
 	capturing bool
+	level     float64
 }
 
 func New(sampleRate int) (*Capture, error) {
@@ -63,10 +66,13 @@ func (c *Capture) Start() error {
 	cfg.SampleRate = c.sampleRate
 
 	c.buf = c.buf[:0]
+	c.level = 0
 
 	onRecv := func(_, samples []byte, _ uint32) {
+		level := RMSPCM16(samples)
 		c.mu.Lock()
 		c.buf = append(c.buf, samples...)
+		c.level = level
 		c.mu.Unlock()
 	}
 	dev, err := malgo.InitDevice(c.ctx.Context, cfg, malgo.DeviceCallbacks{Data: onRecv})
@@ -93,6 +99,7 @@ func (c *Capture) Stop() ([]byte, error) {
 	c.device.Uninit()
 	c.device = nil
 	c.capturing = false
+	c.level = 0
 
 	out := make([]byte, len(c.buf))
 	copy(out, c.buf)
@@ -112,5 +119,26 @@ func (c *Capture) Discard() error {
 	c.device = nil
 	c.capturing = false
 	c.buf = c.buf[:0]
+	c.level = 0
 	return nil
+}
+
+func (c *Capture) Level() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.level
+}
+
+// RMSPCM16 returns normalized RMS level in the range 0..1 for little-endian PCM16.
+func RMSPCM16(pcm []byte) float64 {
+	samples := len(pcm) / 2
+	if samples == 0 {
+		return 0
+	}
+	var sum float64
+	for i := 0; i+1 < len(pcm); i += 2 {
+		v := float64(int16(binary.LittleEndian.Uint16(pcm[i:i+2]))) / 32768.0
+		sum += v * v
+	}
+	return math.Sqrt(sum / float64(samples))
 }

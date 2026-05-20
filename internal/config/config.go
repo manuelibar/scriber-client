@@ -4,16 +4,18 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 type Hotkey struct {
-	Device             string `yaml:"device"`
-	TalkKey            string `yaml:"talk_key"`
-	CycleKey           string `yaml:"cycle_key"`
-	HoldThresholdMs    int    `yaml:"hold_threshold_ms"`
-	DoubleTapWindowMs  int    `yaml:"double_tap_window_ms"`
+	Device            string `yaml:"device"`
+	TalkKey           string `yaml:"talk_key"`
+	CycleKey          string `yaml:"cycle_key"`
+	HoldThresholdMs   int    `yaml:"hold_threshold_ms"`
+	DoubleTapWindowMs int    `yaml:"double_tap_window_ms"`
 }
 
 type Audio struct {
@@ -46,7 +48,7 @@ type Config struct {
 
 func Defaults() *Config {
 	home, _ := os.UserHomeDir()
-	state := filepath.Join(home, ".local", "state", "scriber")
+	state := filepath.Join(home, ".local", "state", "stt")
 	return &Config{
 		Hotkey: Hotkey{
 			Device:            "auto",
@@ -76,7 +78,7 @@ func Defaults() *Config {
 
 func DefaultPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "scriber", "config.yml")
+	return filepath.Join(home, ".config", "stt", "config.yml")
 }
 
 func LoadDefault() (*Config, error) {
@@ -96,13 +98,54 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	cfg.Storage.TranscriptsDir = ExpandPath(cfg.Storage.TranscriptsDir)
+	cfg.Storage.RegistryPath = ExpandPath(cfg.Storage.RegistryPath)
 	return cfg, nil
+}
+
+func ExpandPath(path string) string {
+	if path == "~" {
+		home, _ := os.UserHomeDir()
+		return home
+	}
+	if len(path) >= 2 && path[:2] == "~/" {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, path[2:])
+	}
+	return path
 }
 
 // SocketPath returns the IPC unix socket path.
 func SocketPath() string {
+	return filepath.Join(RuntimeDir(), "daemon.sock")
+}
+
+func RuntimeDir() string {
 	if runtime := os.Getenv("XDG_RUNTIME_DIR"); runtime != "" {
-		return filepath.Join(runtime, "scriber.sock")
+		return filepath.Join(runtime, "stt")
 	}
-	return fmt.Sprintf("/run/user/%d/scriber.sock", os.Getuid())
+	return filepath.Join(os.TempDir(), fmt.Sprintf("stt-%d", os.Getuid()))
+}
+
+func TargetSocketPath(streamName string, pid int) string {
+	return filepath.Join(RuntimeDir(), "targets", fmt.Sprintf("%s-%d.sock", SafeName(streamName), pid))
+}
+
+var nonSafeName = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+func SafeName(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	name = nonSafeName.ReplaceAllString(name, "-")
+	name = strings.Trim(name, "-")
+	if name == "" {
+		return "stream"
+	}
+	if len(name) > 40 {
+		name = name[:40]
+		name = strings.Trim(name, "-")
+	}
+	if name == "" {
+		return "stream"
+	}
+	return name
 }

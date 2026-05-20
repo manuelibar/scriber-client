@@ -10,13 +10,13 @@ import (
 type State int
 
 const (
-	StateIdle State = iota
-	StatePress1Down  // first key is held; tap-vs-hold not yet decided
-	StateHolding     // first key confirmed as hold (push-to-talk)
-	StateLockArmed   // first key was a tap; waiting for a second tap
-	StatePress2Down  // second key is held; tap-vs-hold not yet decided
-	StateLocked      // double-tap confirmed; locked recording
-	StateLockedEnding // terminating tap pressed; waiting for its keyup
+	StateIdle         State = iota
+	StatePress1Down         // first key is held; tap-vs-hold not yet decided
+	StateHolding            // first key confirmed as hold (push-to-talk)
+	StateLockArmed          // first key was a tap; waiting for a second tap
+	StatePress2Down         // second key is held; tap-vs-hold not yet decided
+	StateLocked             // double-tap confirmed; locked recording
+	StateLockedEnding       // terminating tap pressed; waiting for its keyup
 )
 
 func (s State) String() string {
@@ -45,6 +45,7 @@ const (
 	InKeyUp
 	InHoldTimer
 	InLockTimer
+	InCancel
 )
 
 // Decision is a pure-function output of the FSM step. The runner applies it.
@@ -59,6 +60,13 @@ type Decision struct {
 // decide is the pure FSM transition. Unknown (state, input) pairs are no-ops
 // (NewState = current state, no action).
 func decide(state State, in Input) Decision {
+	if in == InCancel {
+		if state == StateIdle {
+			return Decision{NewState: StateIdle}
+		}
+		return Decision{NewState: StateIdle, Action: ActionDiscardCapture, ClearTimers: true}
+	}
+
 	switch state {
 	case StateIdle:
 		if in == InKeyDown {
@@ -161,6 +169,8 @@ func Run(ctx context.Context, cfg FSMConfig, events <-chan Event, out chan<- Act
 				apply(decide(state, InKeyDown))
 			case KeyUp:
 				apply(decide(state, InKeyUp))
+			case Cancel:
+				apply(decide(state, InCancel))
 			}
 		case <-holdC:
 			apply(decide(state, InHoldTimer))

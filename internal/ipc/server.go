@@ -7,22 +7,28 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
-// Registry is what the IPC server needs from the daemon's pane registry.
+// Registry is what the IPC server needs from the daemon's stream registry.
 type Registry interface {
-	Attach(req *AttachRequest) (*Pane, string, error)
-	Detach(alias, tmuxPane string) error
+	Attach(req *AttachRequest) (*Stream, string, error)
+	Detach(name, targetRef string) error
 	DetachAll() error
-	List() ([]Pane, string)
-	Switch(alias string) (string, error)
+	Streams() ([]Stream, string)
+	Select(name string) (string, error)
+	SetSlot(name string, slot int) (*Stream, error)
+	ClearSlot(name string) (*Stream, error)
+	SelectSlot(slot int) (string, error)
 	Cycle() (string, error)
 }
 
-// DaemonState reflects what the IPC server reports for `scriber status`.
+// DaemonState reflects what the IPC server reports for `stt status`.
 type DaemonState interface {
 	State() string
+	RecordingStartedAt() time.Time
+	AudioLevel() float64
 	LastTranscript() (string, time.Time)
 	ServerOK() bool
 }
@@ -38,6 +44,9 @@ func NewServer(socketPath string, reg Registry, dmn DaemonState) *Server {
 }
 
 func (s *Server) Serve(ctx context.Context) error {
+	if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o700); err != nil {
+		return err
+	}
 	_ = os.Remove(s.socketPath)
 	ln, err := net.Listen("unix", s.socketPath)
 	if err != nil {
@@ -50,8 +59,11 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/attach", s.handleAttach)
 	mux.HandleFunc("/detach", s.handleDetach)
-	mux.HandleFunc("/list", s.handleList)
-	mux.HandleFunc("/switch", s.handleSwitch)
+	mux.HandleFunc("/streams", s.handleStreams)
+	mux.HandleFunc("/select", s.handleSelect)
+	mux.HandleFunc("/stream/set-slot", s.handleSetSlot)
+	mux.HandleFunc("/stream/clear-slot", s.handleClearSlot)
+	mux.HandleFunc("/slot/select", s.handleSelectSlot)
 	mux.HandleFunc("/cycle", s.handleCycle)
 	mux.HandleFunc("/status", s.handleStatus)
 
@@ -84,12 +96,12 @@ func (s *Server) handleAttach(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	pane, msg, err := s.reg.Attach(&req)
+	stream, msg, err := s.reg.Attach(&req)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, AttachResponse{Pane: *pane, Message: msg})
+	writeJSON(w, http.StatusOK, AttachResponse{Stream: *stream, Message: msg})
 }
 
 func (s *Server) handleDetach(w http.ResponseWriter, r *http.Request) {
@@ -98,37 +110,80 @@ func (s *Server) handleDetach(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.Alias == "all" {
+	if req.Name == "all" {
 		if err := s.reg.DetachAll(); err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-	} else {
-		if err := s.reg.Detach(req.Alias, req.TMUXPane); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
-			return
-		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if err := s.reg.Detach(req.Name, req.TargetRef); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
-	panes, active := s.reg.List()
-	writeJSON(w, http.StatusOK, ListResponse{Active: active, Panes: panes})
+func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
+	streams, active := s.reg.Streams()
+	writeJSON(w, http.StatusOK, ListResponse{Active: active, Streams: streams})
 }
 
-func (s *Server) handleSwitch(w http.ResponseWriter, r *http.Request) {
-	var req SwitchRequest
+func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
+	var req SelectRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	active, err := s.reg.Switch(req.Alias)
+	active, err := s.reg.Select(req.Name)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, SwitchResponse{Active: active})
+	writeJSON(w, http.StatusOK, SelectResponse{Active: active})
+}
+
+func (s *Server) handleSetSlot(w http.ResponseWriter, r *http.Request) {
+	var req SetSlotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	stream, err := s.reg.SetSlot(req.Name, req.Slot)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, SetSlotResponse{Stream: *stream})
+}
+
+func (s *Server) handleClearSlot(w http.ResponseWriter, r *http.Request) {
+	var req ClearSlotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	stream, err := s.reg.ClearSlot(req.Name)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, SetSlotResponse{Stream: *stream})
+}
+
+func (s *Server) handleSelectSlot(w http.ResponseWriter, r *http.Request) {
+	var req SelectSlotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	active, err := s.reg.SelectSlot(req.Slot)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, SelectResponse{Active: active})
 }
 
 func (s *Server) handleCycle(w http.ResponseWriter, r *http.Request) {
@@ -141,12 +196,26 @@ func (s *Server) handleCycle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	panes, active := s.reg.List()
+	streams, active := s.reg.Streams()
+	activeSlot := 0
+	for _, stream := range streams {
+		if stream.Name == active {
+			activeSlot = stream.Slot
+			break
+		}
+	}
+	recordingMs := 0
+	if started := s.dmn.RecordingStartedAt(); !started.IsZero() {
+		recordingMs = int(time.Since(started) / time.Millisecond)
+	}
 	last, lastAt := s.dmn.LastTranscript()
 	writeJSON(w, http.StatusOK, StatusResponse{
 		State:            s.dmn.State(),
 		Active:           active,
-		PaneCount:        len(panes),
+		ActiveSlot:       activeSlot,
+		RecordingMs:      recordingMs,
+		AudioLevel:       s.dmn.AudioLevel(),
+		StreamCount:      len(streams),
 		LastTranscript:   last,
 		LastTranscriptAt: lastAt,
 		ServerOK:         s.dmn.ServerOK(),

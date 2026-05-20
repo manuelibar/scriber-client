@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,7 +36,8 @@ func runDoctor() error {
 		checkInputGroup(),
 		checkEvdev(),
 		checkMic(cfg),
-		checkTmux(),
+		checkRuntimeDir(),
+		checkDocker(),
 		checkServer(cfg),
 		checkDaemon(),
 	}
@@ -123,23 +125,66 @@ func checkMic(cfg *config.Config) checkResult {
 	if err := mic.Start(); err != nil {
 		return checkResult{name: "microphone", ok: false, msg: "start failed: " + err.Error()}
 	}
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	pcm, err := mic.Stop()
 	if err != nil {
 		return checkResult{name: "microphone", ok: false, msg: "stop failed: " + err.Error()}
 	}
-	return checkResult{name: "microphone", ok: true, msg: fmt.Sprintf("captured %d bytes in 50ms", len(pcm))}
+	if len(pcm) == 0 {
+		return checkResult{
+			name: "microphone",
+			ok:   false,
+			msg:  "captured 0 bytes in 250ms",
+			fix:  "check the default PipeWire/PulseAudio input device and microphone permission",
+		}
+	}
+	return checkResult{name: "microphone", ok: true, msg: fmt.Sprintf("captured %d bytes in 250ms", len(pcm))}
 }
 
-func checkTmux() checkResult {
-	if _, err := exec.LookPath("tmux"); err != nil {
-		return checkResult{name: "tmux", ok: false, msg: "not found in $PATH", fix: "sudo apt install tmux"}
+func checkRuntimeDir() checkResult {
+	dir := config.RuntimeDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return checkResult{name: "runtime dir", ok: false, msg: err.Error()}
 	}
-	out, err := exec.Command("tmux", "-V").Output()
+	return checkResult{name: "runtime dir", ok: true, msg: dir}
+}
+
+func checkDocker() checkResult {
+	docker, err := exec.LookPath("docker")
 	if err != nil {
-		return checkResult{name: "tmux", ok: false, msg: err.Error()}
+		if home, homeErr := os.UserHomeDir(); homeErr == nil {
+			candidate := filepath.Join(home, ".local", "bin", "docker")
+			if st, statErr := os.Stat(candidate); statErr == nil && st.Mode()&0o111 != 0 {
+				docker = candidate
+				err = nil
+			}
+		}
 	}
-	return checkResult{name: "tmux", ok: true, msg: strings.TrimSpace(string(out))}
+	if err != nil {
+		return checkResult{name: "docker", ok: false, msg: "docker client not found", fix: "run ./setup-docker.sh from the repo root"}
+	}
+	cmd := exec.Command(docker, "info")
+	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(docker)+":/usr/local/bin:/usr/bin:/bin")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return checkResult{
+			name: "docker",
+			ok:   false,
+			msg:  "daemon not reachable: " + lastNonEmptyLine(string(out)),
+			fix:  "run ./setup-docker.sh, then log out and back in if group membership changed",
+		}
+	}
+	return checkResult{name: "docker", ok: true, msg: "client and daemon reachable"}
+}
+
+func lastNonEmptyLine(s string) string {
+	lines := strings.FieldsFunc(s, func(r rune) bool { return r == '\n' || r == '\r' })
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line != "" {
+			return line
+		}
+	}
+	return strings.TrimSpace(s)
 }
 
 func checkServer(cfg *config.Config) checkResult {
@@ -148,34 +193,34 @@ func checkServer(cfg *config.Config) checkResult {
 	defer cancel()
 	if err := c.Healthz(ctx); err != nil {
 		return checkResult{
-			name: "scriber-server",
+			name: "stt-server",
 			ok:   false,
 			msg:  err.Error(),
-			fix:  "systemctl --user start scriber-server (and watch journalctl --user -u scriber-server)",
+			fix:  "systemctl --user start stt-backend (and watch make logs)",
 		}
 	}
-	return checkResult{name: "scriber-server", ok: true, msg: "healthy at " + cfg.Server.URL}
+	return checkResult{name: "stt-server", ok: true, msg: "healthy at " + cfg.Server.URL}
 }
 
 func checkDaemon() checkResult {
 	sock := config.SocketPath()
 	if _, err := os.Stat(sock); err != nil {
 		return checkResult{
-			name: "scriber daemon",
+			name: "stt daemon",
 			ok:   false,
 			msg:  "socket not present at " + sock,
-			fix:  "systemctl --user start scriber-daemon (or run `scriber daemon`)",
+			fix:  "systemctl --user start stt-daemon (or run `stt daemon`)",
 		}
 	}
 	cli := ipc.NewClient(sock)
 	resp, err := cli.Status()
 	if err != nil {
-		return checkResult{name: "scriber daemon", ok: false, msg: err.Error()}
+		return checkResult{name: "stt daemon", ok: false, msg: err.Error()}
 	}
 	return checkResult{
-		name: "scriber daemon",
+		name: "stt daemon",
 		ok:   true,
-		msg:  fmt.Sprintf("running, state=%s, panes=%d", resp.State, resp.PaneCount),
+		msg:  fmt.Sprintf("running, state=%s, streams=%d", resp.State, resp.StreamCount),
 	}
 }
 

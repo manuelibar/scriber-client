@@ -62,6 +62,17 @@ func TestDecide_Transitions(t *testing.T) {
 		{"locked + keyup ignored",
 			StateLocked, InKeyUp,
 			Decision{NewState: StateLocked}},
+
+		// External chord handling can cancel an in-progress tap/hold without sending.
+		{"press1 + cancel -> idle+discard",
+			StatePress1Down, InCancel,
+			Decision{NewState: StateIdle, Action: ActionDiscardCapture, ClearTimers: true}},
+		{"holding + cancel -> idle+discard",
+			StateHolding, InCancel,
+			Decision{NewState: StateIdle, Action: ActionDiscardCapture, ClearTimers: true}},
+		{"idle + cancel ignored",
+			StateIdle, InCancel,
+			Decision{NewState: StateIdle}},
 	}
 
 	for _, tc := range tests {

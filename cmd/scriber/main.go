@@ -7,10 +7,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func main() {
+func newRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:           "scriber",
-		Short:         "Push-to-talk dictation that targets a tmux pane",
+		Use:           "stt",
+		Short:         "Terminal-first speech-to-text with named output streams",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -18,13 +18,19 @@ func main() {
 		daemonCmd(),
 		attachCmd(),
 		detachCmd(),
-		listCmd(),
-		switchCmd(),
+		streamCmd(),
+		streamsCmd(),
+		selectCmd(),
 		cycleCmd(),
 		statusCmd(),
+		monitorCmd(),
 		doctorCmd(),
 	)
+	return root
+}
 
+func main() {
+	root := newRootCmd()
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

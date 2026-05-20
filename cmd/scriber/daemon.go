@@ -24,31 +24,51 @@ import (
 )
 
 func daemonCmd() *cobra.Command {
-	return &cobra.Command{
+	var transcriptsDir string
+	c := &cobra.Command{
 		Use:   "daemon",
-		Short: "Run the scriber daemon (hotkey loop + audio + IPC + tmux output)",
+		Short: "Run the STT daemon (hotkey loop + audio + IPC + stream output)",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := config.LoadDefault()
 			if err != nil {
 				return err
 			}
+			if transcriptsDir != "" {
+				cfg.Storage.TranscriptsDir = config.ExpandPath(transcriptsDir)
+			}
 			return runDaemon(cmd.Context(), cfg)
 		},
 	}
+	c.Flags().StringVar(&transcriptsDir, "transcripts-dir", "", "directory for transcript JSON and raw WAV files")
+	return c
 }
 
 type daemonState struct {
-	mu             sync.Mutex
-	fsmState       string
-	serverOK       bool
-	lastTranscript string
-	lastAt         time.Time
+	mu                 sync.Mutex
+	fsmState           string
+	recordingStartedAt time.Time
+	audioLevel         float64
+	serverOK           bool
+	lastTranscript     string
+	lastAt             time.Time
 }
 
 func (d *daemonState) State() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.fsmState
+}
+
+func (d *daemonState) RecordingStartedAt() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.recordingStartedAt
+}
+
+func (d *daemonState) AudioLevel() float64 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.audioLevel
 }
 
 func (d *daemonState) LastTranscript() (string, time.Time) {
@@ -66,6 +86,27 @@ func (d *daemonState) ServerOK() bool {
 func (d *daemonState) setState(s string) {
 	d.mu.Lock()
 	d.fsmState = s
+	d.mu.Unlock()
+}
+
+func (d *daemonState) startRecording() {
+	d.mu.Lock()
+	d.fsmState = "Recording"
+	d.recordingStartedAt = time.Now()
+	d.audioLevel = 0
+	d.mu.Unlock()
+}
+
+func (d *daemonState) stopRecording() {
+	d.mu.Lock()
+	d.recordingStartedAt = time.Time{}
+	d.audioLevel = 0
+	d.mu.Unlock()
+}
+
+func (d *daemonState) setAudioLevel(level float64) {
+	d.mu.Lock()
+	d.audioLevel = level
 	d.mu.Unlock()
 }
 
@@ -98,6 +139,9 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	}
 
 	watched := map[evdev.EvCode]bool{talkCode: true, cycleCode: true}
+	for code := range slotByKeyCode {
+		watched[code] = true
+	}
 	evChan, err := hotkey.Listen(ctx, watched)
 	if err != nil {
 		return fmt.Errorf("hotkey listen: %w", err)
@@ -126,6 +170,7 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	}()
 
 	go healthLoop(ctx, asrClient, state)
+	go levelLoop(ctx, mic, state)
 	go pruneLoop(ctx, reg, cfg.UI.Notifications)
 
 	talkEvents := make(chan hotkey.Event, 16)
@@ -137,7 +182,7 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 		DoubleTapWindow: time.Duration(cfg.Hotkey.DoubleTapWindowMs) * time.Millisecond,
 	}, talkEvents, actions)
 
-	slog.Info("scriber daemon ready", "talk", cfg.Hotkey.TalkKey, "cycle", cfg.Hotkey.CycleKey)
+	slog.Info("stt daemon ready", "talk", cfg.Hotkey.TalkKey, "cycle", cfg.Hotkey.CycleKey)
 
 	for {
 		select {
@@ -150,8 +195,22 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	}
 }
 
+var slotByKeyCode = map[evdev.EvCode]int{
+	evdev.KEY_1: 1,
+	evdev.KEY_2: 2,
+	evdev.KEY_3: 3,
+	evdev.KEY_4: 4,
+	evdev.KEY_5: 5,
+	evdev.KEY_6: 6,
+	evdev.KEY_7: 7,
+	evdev.KEY_8: 8,
+	evdev.KEY_9: 9,
+}
+
 func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCode evdev.EvCode, talkOut chan<- hotkey.Event, reg *output.Registry, notifyOn bool) {
 	defer close(talkOut)
+	talkDown := false
+	suppressTalkUp := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -162,14 +221,42 @@ func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCod
 			}
 			switch ev.Code {
 			case talkCode:
-				select {
-				case talkOut <- ev:
-				case <-ctx.Done():
-					return
+				if ev.Kind == hotkey.KeyDown {
+					talkDown = true
+					suppressTalkUp = false
+					select {
+					case talkOut <- ev:
+					case <-ctx.Done():
+						return
+					}
+					continue
+				}
+				if ev.Kind == hotkey.KeyUp {
+					talkDown = false
+					if suppressTalkUp {
+						suppressTalkUp = false
+						continue
+					}
+					select {
+					case talkOut <- ev:
+					case <-ctx.Done():
+						return
+					}
 				}
 			case cycleCode:
 				if ev.Kind == hotkey.KeyDown {
 					handleCycle(reg, notifyOn)
+				}
+			default:
+				slot, ok := slotByKeyCode[ev.Code]
+				if ok && ev.Kind == hotkey.KeyDown && talkDown {
+					select {
+					case talkOut <- hotkey.Event{Kind: hotkey.Cancel, Code: talkCode, At: ev.At}:
+					case <-ctx.Done():
+						return
+					}
+					suppressTalkUp = true
+					handleSelectSlot(reg, slot, notifyOn)
 				}
 			}
 		}
@@ -179,15 +266,18 @@ func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCod
 func handleAction(ctx context.Context, action hotkey.Action, mic *audio.Capture, asrClient *asr.Client, reg *output.Registry, cfg *config.Config, state *daemonState) {
 	switch action {
 	case hotkey.ActionStartCapture:
-		state.setState("Recording")
 		if err := mic.Start(); err != nil {
 			slog.Error("audio start", "err", err)
 			if cfg.UI.Notifications {
-				notify.Send("scriber error", "audio start: "+err.Error())
+				notify.Send("stt error", "audio start: "+err.Error())
 			}
+			state.stopRecording()
 			state.setState(hotkey.StateIdle.String())
+		} else {
+			state.startRecording()
 		}
 	case hotkey.ActionStopAndSend:
+		state.stopRecording()
 		state.setState("Transcribing")
 		pcm, err := mic.Stop()
 		if err != nil {
@@ -203,6 +293,7 @@ func handleAction(ctx context.Context, action hotkey.Action, mic *audio.Capture,
 		go transcribeAndSend(ctx, pcm, asrClient, reg, cfg, state)
 	case hotkey.ActionDiscardCapture:
 		_ = mic.Discard()
+		state.stopRecording()
 		state.setState(hotkey.StateIdle.String())
 	}
 }
@@ -212,10 +303,21 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 
 	audioMs := len(pcm) * 1000 / 2 / cfg.Audio.SampleRate
 
+	now := time.Now().UTC()
 	rec := persist.Record{
-		Timestamp: time.Now().UTC(),
+		Timestamp: now,
 		AudioMs:   audioMs,
-		Mode:      "tmux",
+		Mode:      ipc.TargetTypePTY,
+	}
+
+	if audioPath, err := persist.SavePCM16WAV(cfg.Storage.TranscriptsDir, now, pcm, cfg.Audio.SampleRate); err != nil {
+		slog.Error("save raw audio", "err", err)
+		rec.AudioSaveError = err.Error()
+		if cfg.UI.Notifications {
+			notify.Send("stt: raw audio save failed", err.Error())
+		}
+	} else {
+		rec.AudioPath = audioPath
 	}
 
 	tctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Server.TimeoutMs)*time.Millisecond)
@@ -227,7 +329,7 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 		rec.Error = err.Error()
 		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
 		if cfg.UI.Notifications {
-			notify.Send("scriber: transcribe failed", err.Error())
+			notify.Send("stt: transcribe failed", err.Error())
 		}
 		return
 	}
@@ -235,35 +337,28 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 	rec.Raw = result.Raw
 	rec.InferenceMs = result.Ms
 
-	pane := reg.ActivePane()
-	if pane == nil {
+	stream := reg.ActiveStream()
+	if stream == nil {
 		rec.Mode = "noop"
-		rec.Error = "no pane attached"
+		rec.Error = "no stream selected"
 		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
 		if cfg.UI.Notifications {
-			notify.Send("scriber: no pane attached", "run `scriber attach` in a tmux pane")
+			notify.Send("stt: no stream selected", "run `stt attach NAME` in a terminal")
 		}
 		return
 	}
-	rec.TargetPane = pane.PaneID
-	rec.TargetAlias = pane.Alias
+	target := stream.Target
+	rec.TargetStream = stream.Name
+	rec.TargetType = target.TargetType
+	rec.TargetRef = target.TargetRef
 
-	if !output.TmuxAlive(pane.PaneID) {
-		_ = reg.Detach(pane.Alias, "")
-		rec.Error = "target pane is dead"
-		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
-		if cfg.UI.Notifications {
-			notify.Send("scriber: pane gone", pane.Alias+" removed")
-		}
-		return
-	}
-
-	if err := output.TmuxSendKeys(pane.PaneID, result.Text); err != nil {
-		slog.Error("tmux send-keys", "err", err)
+	if err := output.SendText(target, result.Text); err != nil {
+		slog.Error("send text", "err", err)
+		_ = reg.PruneDead()
 		rec.Error = err.Error()
 		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
 		if cfg.UI.Notifications {
-			notify.Send("scriber: send failed", err.Error())
+			notify.Send("stt: send failed", err.Error())
 		}
 		return
 	}
@@ -271,22 +366,37 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 	rec.Success = true
 	_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
 	state.setLastTranscript(result.Text)
-	slog.Info("dictated", "to", pane.Alias, "chars", len(result.Text), "audio_ms", audioMs, "infer_ms", result.Ms)
+	slog.Info("dictated", "stream", stream.Name, "target", target.TargetRef, "chars", len(result.Text), "audio_ms", audioMs, "infer_ms", result.Ms)
 }
 
 func handleCycle(reg *output.Registry, notifyOn bool) {
 	active, err := reg.Cycle()
 	if err != nil {
 		if notifyOn {
-			notify.Send("scriber: cycle failed", err.Error())
+			notify.Send("stt: cycle failed", err.Error())
 		}
 		slog.Warn("cycle", "err", err)
 		return
 	}
 	if notifyOn {
-		notify.Send("scriber → "+active, "")
+		notify.Send("stt → "+active, "")
 	}
 	slog.Info("cycled", "active", active)
+}
+
+func handleSelectSlot(reg *output.Registry, slot int, notifyOn bool) {
+	active, err := reg.SelectSlot(slot)
+	if err != nil {
+		if notifyOn {
+			notify.Send(fmt.Sprintf("stt: slot %d failed", slot), err.Error())
+		}
+		slog.Warn("select slot", "slot", slot, "err", err)
+		return
+	}
+	if notifyOn {
+		notify.Send(fmt.Sprintf("stt slot %d → %s", slot, active), "")
+	}
+	slog.Info("selected slot", "slot", slot, "active", active)
 }
 
 func healthLoop(ctx context.Context, asrClient *asr.Client, state *daemonState) {
@@ -308,6 +418,23 @@ func healthLoop(ctx context.Context, asrClient *asr.Client, state *daemonState) 
 	}
 }
 
+func levelLoop(ctx context.Context, mic *audio.Capture, state *daemonState) {
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if state.RecordingStartedAt().IsZero() {
+				state.setAudioLevel(0)
+				continue
+			}
+			state.setAudioLevel(mic.Level())
+		}
+	}
+}
+
 func pruneLoop(ctx context.Context, reg *output.Registry, notifyOn bool) {
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
@@ -316,10 +443,10 @@ func pruneLoop(ctx context.Context, reg *output.Registry, notifyOn bool) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
-			for _, alias := range reg.PruneDead() {
-				slog.Info("pruned dead pane", "alias", alias)
+			for _, streamName := range reg.PruneDead() {
+				slog.Info("marked dead stream target", "stream", streamName)
 				if notifyOn {
-					notify.Send("scriber: pane removed", alias+" gone")
+					notify.Send("stt: stream target gone", streamName+" marked dead")
 				}
 			}
 		}

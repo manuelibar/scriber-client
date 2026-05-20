@@ -49,7 +49,7 @@ func (c *Client) get(path string, out any) error {
 func (c *Client) do(req *http.Request, out any) error {
 	resp, err := c.hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("daemon not reachable (is `scriber daemon` running?): %w", err)
+		return fmt.Errorf("daemon not reachable (is `stt daemon` running?): %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -75,17 +75,41 @@ func (c *Client) Detach(req *DetachRequest) error {
 	return c.post("/detach", req, nil)
 }
 
-func (c *Client) List() (*ListResponse, error) {
+func (c *Client) Streams() (*ListResponse, error) {
 	var out ListResponse
-	if err := c.get("/list", &out); err != nil {
+	if err := c.get("/streams", &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-func (c *Client) Switch(alias string) (*SwitchResponse, error) {
-	var out SwitchResponse
-	if err := c.post("/switch", SwitchRequest{Alias: alias}, &out); err != nil {
+func (c *Client) Select(name string) (*SelectResponse, error) {
+	var out SelectResponse
+	if err := c.post("/select", SelectRequest{Name: name}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) SetSlot(name string, slot int) (*SetSlotResponse, error) {
+	var out SetSlotResponse
+	if err := c.post("/stream/set-slot", SetSlotRequest{Name: name, Slot: slot}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ClearSlot(name string) (*SetSlotResponse, error) {
+	var out SetSlotResponse
+	if err := c.post("/stream/clear-slot", ClearSlotRequest{Name: name}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) SelectSlot(slot int) (*SelectResponse, error) {
+	var out SelectResponse
+	if err := c.post("/slot/select", SelectSlotRequest{Slot: slot}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

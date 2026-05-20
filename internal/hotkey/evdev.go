@@ -14,6 +14,7 @@ type EventKind int
 const (
 	KeyDown EventKind = iota
 	KeyUp
+	Cancel
 )
 
 func (k EventKind) String() string {
@@ -22,6 +23,8 @@ func (k EventKind) String() string {
 		return "down"
 	case KeyUp:
 		return "up"
+	case Cancel:
+		return "cancel"
 	default:
 		return "?"
 	}
