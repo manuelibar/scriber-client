@@ -394,6 +394,20 @@ func (r *Registry) ActiveStream() *ipc.Stream {
 	return &cp
 }
 
+func (r *Registry) Stream(name string) *ipc.Stream {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := r.findStreamLocked(strings.TrimSpace(name))
+	if idx < 0 {
+		idx = r.findStreamByLabelLocked(strings.TrimSpace(name))
+	}
+	if idx < 0 || !streamIsLive(r.state.Streams[idx]) {
+		return nil
+	}
+	cp := r.state.Streams[idx]
+	return &cp
+}
+
 func (r *Registry) SendTextToActive(text string) (string, error) {
 	if text == "" {
 		return "", fmt.Errorf("text is empty")
@@ -419,23 +433,73 @@ func (r *Registry) SendTextToActive(text string) (string, error) {
 	return streamLabel(*stream), nil
 }
 
+func (r *Registry) SendTextToStream(name, text string) (string, error) {
+	if text == "" {
+		return "", fmt.Errorf("text is empty")
+	}
+	stream := r.Stream(name)
+	if stream == nil {
+		return "", fmt.Errorf("stream %q has no live target", name)
+	}
+	if err := SendText(stream.Target, text); err != nil {
+		_ = r.PruneDead()
+		return streamLabel(*stream), err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := r.findStreamByIDLocked(stream.ID)
+	if idx >= 0 {
+		r.state.Streams[idx].LastUsedAt = time.Now().UTC()
+		if err := r.saveLocked(); err != nil {
+			return streamLabel(*stream), err
+		}
+	}
+	return streamLabel(*stream), nil
+}
+
 // PruneDead marks streams whose target process/socket no longer exists as dead.
 func (r *Registry) PruneDead() []string {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	var dead []string
+	checks := make([]ipc.Stream, 0, len(r.state.Streams))
 	for i := range r.state.Streams {
-		s := &r.state.Streams[i]
+		s := r.state.Streams[i]
 		if s.Status == ipc.StreamStatusDead || s.Target.TargetRef == "" {
 			continue
 		}
-		if r.backend.Alive(s.Target) {
-			s.Target.LastSeenAt = time.Now().UTC()
+		checks = append(checks, s)
+	}
+	r.mu.Unlock()
+
+	type liveness struct {
+		id    string
+		alive bool
+	}
+	results := make([]liveness, 0, len(checks))
+	for _, stream := range checks {
+		results = append(results, liveness{id: stream.ID, alive: r.backend.Alive(stream.Target)})
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	aliveByID := map[string]bool{}
+	for _, result := range results {
+		aliveByID[result.id] = result.alive
+	}
+	now := time.Now().UTC()
+	var dead []string
+	for i := range r.state.Streams {
+		s := &r.state.Streams[i]
+		alive, checked := aliveByID[s.ID]
+		if !checked || s.Status == ipc.StreamStatusDead || s.Target.TargetRef == "" {
+			continue
+		}
+		if alive {
+			s.Target.LastSeenAt = now
 			continue
 		}
 		s.Status = ipc.StreamStatusDead
-		dead = append(dead, s.Name)
+		dead = append(dead, streamLabel(*s))
 	}
 	if len(dead) == 0 {
 		return nil
@@ -483,6 +547,18 @@ func (r *Registry) findStreamByIDLocked(id string) int {
 	}
 	for i, s := range r.state.Streams {
 		if s.ID == id {
+			return i
+		}
+	}
+	return -1
+}
+
+func (r *Registry) findStreamByLabelLocked(label string) int {
+	if label == "" {
+		return -1
+	}
+	for i, s := range r.state.Streams {
+		if streamLabel(s) == label {
 			return i
 		}
 	}

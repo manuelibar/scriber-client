@@ -3,75 +3,34 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/holoplot/go-evdev"
-
+	"scriber/internal/asr"
+	"scriber/internal/config"
 	"scriber/internal/hotkey"
 	"scriber/internal/ipc"
+	"scriber/internal/notify"
 	"scriber/internal/output"
+	"scriber/internal/persist"
 )
 
-func TestSplitEventsSlotChordCancelsTalkCaptureAndSelectsSlot(t *testing.T) {
+func TestRouteCommandSelectSlotUpdatesRegistry(t *testing.T) {
 	reg, path := registryWithSlotsAt(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	recorder := make(chan recorderCommand, 1)
+	state := &daemonState{fsmState: hotkey.StateIdle.String()}
+	locked := false
 
-	originalNotify := notifySend
-	t.Cleanup(func() { notifySend = originalNotify })
-	type notification struct {
-		title string
-		body  string
-	}
-	notifications := make(chan notification, 2)
-	notifySend = func(title, body string) {
-		notifications <- notification{title: title, body: body}
-	}
-
-	in := make(chan hotkey.Event, 4)
-	out := make(chan hotkey.Event, 3)
-	go splitEvents(ctx, in, evdev.KEY_RIGHTCTRL, evdev.KEY_RIGHTMETA, evdev.KEY_ESC, out, reg, true)
-
-	now := time.Now()
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_2, At: now.Add(20 * time.Millisecond)}
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_2, At: now.Add(25 * time.Millisecond)}
-	in <- hotkey.Event{Kind: hotkey.KeyUp, Code: evdev.KEY_RIGHTCTRL, At: now.Add(40 * time.Millisecond)}
-	close(in)
-
-	var events []hotkey.Event
-	for ev := range out {
-		events = append(events, ev)
-	}
-	if len(events) != 2 {
-		t.Fatalf("forwarded events = %+v, want talk down and cancel", events)
-	}
-	if events[0].Kind != hotkey.KeyDown || events[1].Kind != hotkey.Cancel {
-		t.Fatalf("forwarded events = %+v, want keydown then cancel", events)
-	}
-
-	select {
-	case got := <-notifications:
-		if got.title != "stt slot 2 → notes" || got.body != "" {
-			t.Fatalf("notification = %+v, want stt slot 2 → notes / empty", got)
-		}
-	default:
-		t.Fatalf("notification was not sent")
-	}
-	select {
-	case got := <-notifications:
-		t.Fatalf("unexpected duplicate notification: %+v", got)
-	default:
-	}
+	routeCommand(context.Background(), hotkey.Command{Action: hotkey.ActionSelectSlot, Slot: 2}, recorder, reg, notify.NewWorker(context.Background(), false, 1), state, &locked)
 
 	_, active, activeSlot := reg.Streams()
 	if active != "notes" || activeSlot != 2 {
 		t.Fatalf("active stream = %q slot=%d, want notes slot=2", active, activeSlot)
 	}
-
 	var persisted struct {
 		ActiveStream string `json:"active_stream,omitempty"`
 		ActiveSlot   int    `json:"active_slot,omitempty"`
@@ -88,92 +47,56 @@ func TestSplitEventsSlotChordCancelsTalkCaptureAndSelectsSlot(t *testing.T) {
 	}
 }
 
-func TestSplitEventsTargetChordCancelsTalkCaptureAndNotifiesTarget(t *testing.T) {
+func TestRouteCommandCycleDoesNotUseRecorder(t *testing.T) {
 	reg := registryWithSlots(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	recorder := make(chan recorderCommand, 1)
+	state := &daemonState{fsmState: hotkey.StateIdle.String()}
+	locked := false
 
-	originalNotify := notifySend
-	t.Cleanup(func() { notifySend = originalNotify })
-	type notification struct {
-		title string
-		body  string
-	}
-	notifications := make(chan notification, 2)
-	notifySend = func(title, body string) {
-		notifications <- notification{title: title, body: body}
-	}
+	routeCommand(context.Background(), hotkey.Command{Action: hotkey.ActionCycleStream}, recorder, reg, notify.NewWorker(context.Background(), false, 1), state, &locked)
 
-	in := make(chan hotkey.Event, 4)
-	out := make(chan hotkey.Event, 3)
-	go splitEvents(ctx, in, evdev.KEY_RIGHTCTRL, evdev.KEY_RIGHTMETA, evdev.KEY_ESC, out, reg, true)
-
-	now := time.Now()
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_0, At: now.Add(20 * time.Millisecond)}
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_0, At: now.Add(25 * time.Millisecond)}
-	in <- hotkey.Event{Kind: hotkey.KeyUp, Code: evdev.KEY_RIGHTCTRL, At: now.Add(40 * time.Millisecond)}
-	close(in)
-
-	var events []hotkey.Event
-	for ev := range out {
-		events = append(events, ev)
-	}
-	if len(events) != 2 {
-		t.Fatalf("forwarded events = %+v, want talk down and cancel", events)
-	}
-	if events[0].Kind != hotkey.KeyDown || events[1].Kind != hotkey.Cancel {
-		t.Fatalf("forwarded events = %+v, want keydown then cancel", events)
-	}
-
-	select {
-	case got := <-notifications:
-		if got.title != "stt target" || got.body != "slot=1 name=codex" {
-			t.Fatalf("notification = %+v, want stt target / slot=1 name=codex", got)
-		}
-	default:
-		t.Fatalf("notification was not sent")
-	}
-	select {
-	case got := <-notifications:
-		t.Fatalf("unexpected duplicate notification: %+v", got)
-	default:
-	}
-}
-
-func TestSplitEventsCycleDoesNotNotify(t *testing.T) {
-	reg := registryWithSlots(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	originalNotify := notifySend
-	t.Cleanup(func() { notifySend = originalNotify })
-	notifications := make(chan struct{}, 1)
-	notifySend = func(title, body string) {
-		notifications <- struct{}{}
-	}
-
-	in := make(chan hotkey.Event, 3)
-	out := make(chan hotkey.Event, 3)
-	go splitEvents(ctx, in, evdev.KEY_RIGHTCTRL, evdev.KEY_RIGHTMETA, evdev.KEY_ESC, out, reg, true)
-
-	now := time.Now()
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_RIGHTMETA, At: now}
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_RIGHTMETA, At: now.Add(5 * time.Millisecond)}
-	in <- hotkey.Event{Kind: hotkey.KeyUp, Code: evdev.KEY_RIGHTMETA, At: now.Add(20 * time.Millisecond)}
-	close(in)
-
-	for range out {
-	}
-
-	select {
-	case <-notifications:
-		t.Fatalf("cycle should not notify")
-	default:
+	if len(recorder) != 0 {
+		t.Fatalf("cycle should not send recorder commands")
 	}
 	_, active, activeSlot := reg.Streams()
 	if active != "notes" || activeSlot != 2 {
 		t.Fatalf("active stream = %q slot=%d, want notes slot=2", active, activeSlot)
+	}
+}
+
+func TestRouteCommandCaptureDoesNotBlockWhenRecorderQueueFull(t *testing.T) {
+	reg := registryWithSlots(t)
+	recorder := make(chan recorderCommand, 1)
+	recorder <- recorderCommand{action: hotkey.ActionStartMomentaryCapture}
+	state := &daemonState{fsmState: hotkey.StateIdle.String()}
+	locked := false
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		routeCommand(context.Background(), hotkey.Command{Action: hotkey.ActionStartMomentaryCapture}, recorder, reg, notify.NewWorker(context.Background(), false, 1), state, &locked)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("routeCommand blocked on a full recorder queue")
+	}
+}
+
+func TestRouteCommandLockedToggleMapsToStartThenFinalize(t *testing.T) {
+	reg := registryWithSlots(t)
+	recorder := make(chan recorderCommand, 2)
+	state := &daemonState{fsmState: hotkey.StateIdle.String()}
+	locked := false
+
+	routeCommand(context.Background(), hotkey.Command{Action: hotkey.ActionToggleLockedCapture}, recorder, reg, nil, state, &locked)
+	routeCommand(context.Background(), hotkey.Command{Action: hotkey.ActionToggleLockedCapture}, recorder, reg, nil, state, &locked)
+
+	first := <-recorder
+	second := <-recorder
+	if first.action != hotkey.ActionStartMomentaryCapture || second.action != hotkey.ActionFinalizeCapture {
+		t.Fatalf("recorder actions = %s then %s, want start then finalize", first.action, second.action)
 	}
 }
 
@@ -184,62 +107,115 @@ func TestFormatTargetNotificationWithoutActiveStream(t *testing.T) {
 	}
 }
 
-func TestSplitEventsEscapeCancelsTalkCapture(t *testing.T) {
-	reg := registryWithSlots(t)
+func TestASRTimeoutLeavesFailedRecordWithAudioPath(t *testing.T) {
+	dir := t.TempDir()
+	store := persist.NewCaptureStore(dir)
+	writer, err := store.NewCapture(16000)
+	if err != nil {
+		t.Fatalf("NewCapture() error = %v", err)
+	}
+	meta, err := writer.FinalizeWithPCM(make([]byte, 320))
+	if err != nil {
+		t.Fatalf("FinalizeWithPCM() error = %v", err)
+	}
+	meta, err = store.Update(meta.CaptureID, func(next *persist.CaptureMeta) {
+		next.Stage = persist.StageQueuedForASR
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+	}))
+	defer server.Close()
+
+	cfg := config.Defaults()
+	cfg.Storage.TranscriptsDir = dir
+	cfg.Server.URL = server.URL
+	cfg.Server.TimeoutMs = 10
+	state := &daemonState{fsmState: hotkey.StateIdle.String(), jobs: map[string]ipc.JobSnapshot{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	jobs := make(chan string, 1)
+	delivery := make(chan string, 1)
+	go asrWorkerLoop(ctx, store, asr.New(server.URL, 10*time.Millisecond), cfg, state, jobs, delivery)
+	jobs <- meta.CaptureID
 
-	in := make(chan hotkey.Event, 3)
-	out := make(chan hotkey.Event, 3)
-	go splitEvents(ctx, in, evdev.KEY_RIGHTCTRL, evdev.KEY_RIGHTMETA, evdev.KEY_ESC, out, reg, false)
-
-	now := time.Now()
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_ESC, At: now.Add(20 * time.Millisecond)}
-	in <- hotkey.Event{Kind: hotkey.KeyUp, Code: evdev.KEY_RIGHTCTRL, At: now.Add(40 * time.Millisecond)}
-	close(in)
-
-	var events []hotkey.Event
-	for ev := range out {
-		events = append(events, ev)
+	waitFor(t, 300*time.Millisecond, func() bool {
+		got, err := store.Read(meta.CaptureID)
+		return err == nil && got.Stage == persist.StageFailed
+	})
+	failed, err := store.Read(meta.CaptureID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(events) != 2 {
-		t.Fatalf("forwarded events = %+v, want talk down and cancel", events)
+	if failed.FailedStage != persist.StageTranscribing || !failed.Retryable || failed.AudioPath == "" {
+		t.Fatalf("failed meta = %+v, want retryable Transcribing failure with audio path", failed)
 	}
-	if events[0].Kind != hotkey.KeyDown || events[1].Kind != hotkey.Cancel {
-		t.Fatalf("forwarded events = %+v, want keydown then cancel", events)
+	records, err := persist.QueryHistory(dir, persist.HistoryQuery{IncludeEmpty: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].AudioPath == "" || records[0].Error == "" {
+		t.Fatalf("history records = %+v, want failed ASR record with audio path and error", records)
 	}
 }
 
-func TestSplitEventsBackspaceDoesNotCancelOrClear(t *testing.T) {
+func TestDeliveryFailureLeavesTranscriptInHistory(t *testing.T) {
+	dir := t.TempDir()
+	store := persist.NewCaptureStore(dir)
+	writer, err := store.NewCapture(16000)
+	if err != nil {
+		t.Fatalf("NewCapture() error = %v", err)
+	}
+	meta, err := writer.FinalizeWithPCM(make([]byte, 320))
+	if err != nil {
+		t.Fatalf("FinalizeWithPCM() error = %v", err)
+	}
+	meta, err = store.Update(meta.CaptureID, func(next *persist.CaptureMeta) {
+		next.Stage = persist.StageQueuedForDelivery
+		next.Transcript = "delivery should persist this"
+		next.TargetStream = "codex-main"
+		next.TargetType = "unsupported"
+		next.TargetRef = "target"
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Storage.TranscriptsDir = dir
+	state := &daemonState{fsmState: hotkey.StateIdle.String(), jobs: map[string]ipc.JobSnapshot{}}
 	reg := registryWithSlots(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	jobs := make(chan string, 1)
+	go deliveryWorkerLoop(ctx, store, reg, cfg, state, jobs)
+	jobs <- meta.CaptureID
 
-	in := make(chan hotkey.Event, 3)
-	out := make(chan hotkey.Event, 3)
-	go splitEvents(ctx, in, evdev.KEY_RIGHTCTRL, evdev.KEY_RIGHTMETA, evdev.KEY_ESC, out, reg, false)
+	waitFor(t, 300*time.Millisecond, func() bool {
+		got, err := store.Read(meta.CaptureID)
+		return err == nil && got.Stage == persist.StageFailed
+	})
+	records, err := persist.QueryHistory(dir, persist.HistoryQuery{IncludeEmpty: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Transcript != "delivery should persist this" || records[0].Error == "" {
+		t.Fatalf("history records = %+v, want failed delivery record with transcript text", records)
+	}
+}
 
-	now := time.Now()
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
-	in <- hotkey.Event{Kind: hotkey.KeyDown, Code: evdev.KEY_BACKSPACE, At: now.Add(20 * time.Millisecond)}
-	in <- hotkey.Event{Kind: hotkey.KeyUp, Code: evdev.KEY_RIGHTCTRL, At: now.Add(40 * time.Millisecond)}
-	close(in)
-
-	var events []hotkey.Event
-	for ev := range out {
-		events = append(events, ev)
+func waitFor(t *testing.T, timeout time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if ok() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	if len(events) != 2 {
-		t.Fatalf("forwarded events = %+v, want talk down and talk up only", events)
-	}
-	if events[0].Kind != hotkey.KeyDown || events[1].Kind != hotkey.KeyUp {
-		t.Fatalf("forwarded events = %+v, want keydown then keyup", events)
-	}
-	_, active, activeSlot := reg.Streams()
-	if active != "codex" || activeSlot != 1 {
-		t.Fatalf("active stream = %q slot=%d, want codex slot=1", active, activeSlot)
-	}
+	t.Fatalf("condition was not met within %s", timeout)
 }
 
 func registryWithSlots(t *testing.T) *output.Registry {

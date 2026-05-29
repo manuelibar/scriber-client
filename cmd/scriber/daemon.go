@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -51,6 +52,7 @@ type daemonState struct {
 	serverOK           bool
 	lastTranscript     string
 	lastAt             time.Time
+	jobs               map[string]ipc.JobSnapshot
 }
 
 func (d *daemonState) State() string {
@@ -81,6 +83,26 @@ func (d *daemonState) ServerOK() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.serverOK
+}
+
+func (d *daemonState) Jobs() []ipc.JobSnapshot {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.jobs) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	out := make([]ipc.JobSnapshot, 0, len(d.jobs))
+	for _, job := range d.jobs {
+		if !job.CreatedAt.IsZero() {
+			job.AgeMs = int(now.Sub(job.CreatedAt) / time.Millisecond)
+		}
+		if !job.UpdatedAt.IsZero() {
+			job.UpdatedAgoMs = int(now.Sub(job.UpdatedAt) / time.Millisecond)
+		}
+		out = append(out, job)
+	}
+	return out
 }
 
 func (d *daemonState) setState(s string) {
@@ -123,6 +145,47 @@ func (d *daemonState) setServerOK(ok bool) {
 	d.mu.Unlock()
 }
 
+func (d *daemonState) updateJob(meta persist.CaptureMeta) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.jobs == nil {
+		d.jobs = map[string]ipc.JobSnapshot{}
+	}
+	now := time.Now().UTC()
+	age := 0
+	if !meta.CreatedAt.IsZero() {
+		age = int(now.Sub(meta.CreatedAt) / time.Millisecond)
+	}
+	updatedAgo := 0
+	if !meta.UpdatedAt.IsZero() {
+		updatedAgo = int(now.Sub(meta.UpdatedAt) / time.Millisecond)
+	}
+	d.jobs[meta.CaptureID] = ipc.JobSnapshot{
+		CaptureID:    meta.CaptureID,
+		Stage:        meta.Stage,
+		AgeMs:        age,
+		UpdatedAgoMs: updatedAgo,
+		CreatedAt:    meta.CreatedAt,
+		UpdatedAt:    meta.UpdatedAt,
+		AudioPath:    meta.AudioPath,
+		TargetStream: meta.TargetStream,
+		TargetType:   meta.TargetType,
+		TargetRef:    meta.TargetRef,
+		Error:        meta.Error,
+		Retryable:    meta.Retryable,
+	}
+	d.fsmState = meta.Stage
+}
+
+func (d *daemonState) removeJob(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.jobs, id)
+	if len(d.jobs) == 0 && d.recordingStartedAt.IsZero() {
+		d.fsmState = hotkey.StateIdle.String()
+	}
+}
+
 func runDaemon(parent context.Context, cfg *config.Config) error {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
@@ -157,12 +220,15 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("cancel_key: %w", err)
 	}
+	queryCode, err := hotkey.ParseKey(cfg.Hotkey.QueryKey)
+	if err != nil {
+		return fmt.Errorf("query_key: %w", err)
+	}
 
-	watched := map[evdev.EvCode]bool{talkCode: true, cycleCode: true, cancelCode: true}
+	watched := map[evdev.EvCode]bool{talkCode: true, cycleCode: true, cancelCode: true, queryCode: true}
 	for code := range slotByKeyCode {
 		watched[code] = true
 	}
-	watched[targetKeyCode] = true
 	evChan, err := hotkey.Listen(ctx, watched)
 	if err != nil {
 		return fmt.Errorf("hotkey listen: %w", err)
@@ -172,18 +238,18 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("audio init: %w", err)
 	}
-	defer mic.Close()
+	defer closeCaptureWithTimeout(mic, time.Second)
 
 	asrClient := asr.New(cfg.Server.URL, time.Duration(cfg.Server.TimeoutMs)*time.Millisecond)
+	captureStore := persist.NewCaptureStore(cfg.Storage.TranscriptsDir)
 
 	reg, err := output.NewRegistry(cfg.Storage.RegistryPath)
 	if err != nil {
 		return fmt.Errorf("registry: %w", err)
 	}
 
-	state := &daemonState{fsmState: hotkey.StateIdle.String()}
+	state := &daemonState{fsmState: hotkey.StateIdle.String(), jobs: map[string]ipc.JobSnapshot{}}
 	var serviceWG sync.WaitGroup
-	var workWG sync.WaitGroup
 	goService := func(fn func()) {
 		serviceWG.Add(1)
 		go func() {
@@ -207,31 +273,44 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	goService(func() { levelLoop(ctx, mic, state) })
 	goService(func() { pruneLoop(ctx, reg) })
 
-	talkEvents := make(chan hotkey.Event, 16)
+	notifier := notify.NewWorker(ctx, cfg.UI.Notifications, 8)
+	commands := make(chan hotkey.Command, 32)
 	goService(func() {
-		splitEvents(ctx, evChan, talkCode, cycleCode, cancelCode, talkEvents, reg, cfg.UI.Notifications)
-	})
-
-	actions := make(chan hotkey.Action, 8)
-	goService(func() {
-		hotkey.Run(ctx, hotkey.FSMConfig{
+		hotkey.RunRecognizer(ctx, hotkey.FSMConfig{
 			HoldThreshold:   time.Duration(cfg.Hotkey.HoldThresholdMs) * time.Millisecond,
 			DoubleTapWindow: time.Duration(cfg.Hotkey.DoubleTapWindowMs) * time.Millisecond,
-		}, talkEvents, actions)
+			TalkKey:         talkCode,
+			CancelKey:       cancelCode,
+			QueryKey:        queryCode,
+			CycleKey:        cycleCode,
+			SlotKeys:        slotByKeyCode,
+		}, evChan, commands)
 	})
 
-	slog.Info("stt daemon ready", "talk", cfg.Hotkey.TalkKey, "cycle", cfg.Hotkey.CycleKey, "cancel", cfg.Hotkey.CancelKey)
+	recorderCommands := make(chan recorderCommand, 16)
+	finalizedCaptures := make(chan persist.CaptureMeta, 16)
+	asrJobs := make(chan string, 16)
+	deliveryJobs := make(chan string, 16)
+	goService(func() { recorderLoop(ctx, mic, captureStore, cfg, state, recorderCommands, finalizedCaptures) })
+	goService(func() { finalizerLoop(ctx, captureStore, state, finalizedCaptures, asrJobs) })
+	goService(func() { asrWorkerLoop(ctx, captureStore, asrClient, cfg, state, asrJobs, deliveryJobs) })
+	goService(func() { deliveryWorkerLoop(ctx, captureStore, reg, cfg, state, deliveryJobs) })
 
+	if err := recoverDurableWorkflow(ctx, captureStore, state, asrJobs, deliveryJobs); err != nil {
+		slog.Warn("capture recovery", "err", err)
+	}
+
+	slog.Info("stt daemon ready", "talk", cfg.Hotkey.TalkKey, "cycle", cfg.Hotkey.CycleKey, "cancel", cfg.Hotkey.CancelKey, "query", cfg.Hotkey.QueryKey)
+
+	lockedCaptureActive := false
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("daemon stopping")
-			_ = mic.Discard()
-			waitGroupWithTimeout("transcription work", &workWG, 5*time.Second)
 			waitGroupWithTimeout("daemon services", &serviceWG, 2*time.Second)
 			return nil
-		case action := <-actions:
-			handleAction(ctx, action, mic, asrClient, reg, cfg, state, &workWG)
+		case cmd := <-commands:
+			routeCommand(ctx, cmd, recorderCommands, reg, notifier, state, &lockedCaptureActive)
 		}
 	}
 }
@@ -249,223 +328,392 @@ func waitGroupWithTimeout(name string, wg *sync.WaitGroup, timeout time.Duration
 	}
 }
 
-var slotByKeyCode = map[evdev.EvCode]int{
-	evdev.KEY_1: 1,
-	evdev.KEY_2: 2,
-	evdev.KEY_3: 3,
-	evdev.KEY_4: 4,
-	evdev.KEY_5: 5,
-	evdev.KEY_6: 6,
-	evdev.KEY_7: 7,
-	evdev.KEY_8: 8,
-	evdev.KEY_9: 9,
+var slotByKeyCode = hotkey.DefaultSlotKeys()
+
+type recorderCommand struct {
+	action hotkey.Action
 }
 
-const targetKeyCode = evdev.KEY_0
-
-var notifySend = notify.Send
-
-func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCode, cancelCode evdev.EvCode, talkOut chan<- hotkey.Event, reg *output.Registry, notifyOn bool) {
-	defer close(talkOut)
-	talkDown := false
-	cycleDown := false
-	suppressTalkUp := false
-	chordHandled := false
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev, ok := <-in:
-			if !ok {
-				return
-			}
-			switch ev.Code {
-			case talkCode:
-				if ev.Kind == hotkey.KeyDown {
-					if talkDown {
-						continue
-					}
-					talkDown = true
-					suppressTalkUp = false
-					chordHandled = false
-					select {
-					case talkOut <- ev:
-					case <-ctx.Done():
-						return
-					}
-					continue
-				}
-				if ev.Kind == hotkey.KeyUp {
-					if !talkDown {
-						continue
-					}
-					talkDown = false
-					chordHandled = false
-					if suppressTalkUp {
-						suppressTalkUp = false
-						continue
-					}
-					select {
-					case talkOut <- ev:
-					case <-ctx.Done():
-						return
-					}
-				}
-			case cycleCode:
-				if ev.Kind == hotkey.KeyDown {
-					if cycleDown {
-						continue
-					}
-					cycleDown = true
-					handleCycle(reg)
-				}
-				if ev.Kind == hotkey.KeyUp {
-					cycleDown = false
-				}
-			case targetKeyCode:
-				if ev.Kind == hotkey.KeyDown && talkDown {
-					if chordHandled {
-						continue
-					}
-					chordHandled = true
-					select {
-					case talkOut <- hotkey.Event{Kind: hotkey.Cancel, Code: talkCode, At: ev.At}:
-					case <-ctx.Done():
-						return
-					}
-					suppressTalkUp = true
-					handleTargetNotification(reg, notifyOn)
-				}
-			case cancelCode:
-				if ev.Kind == hotkey.KeyDown {
-					if talkDown && chordHandled {
-						continue
-					}
-					if talkDown {
-						chordHandled = true
-					}
-					select {
-					case talkOut <- hotkey.Event{Kind: hotkey.Cancel, Code: cancelCode, At: ev.At}:
-					case <-ctx.Done():
-						return
-					}
-					if talkDown {
-						suppressTalkUp = true
-					}
-				}
-			default:
-				slot, ok := slotByKeyCode[ev.Code]
-				if ok && ev.Kind == hotkey.KeyDown && talkDown {
-					if chordHandled {
-						continue
-					}
-					chordHandled = true
-					select {
-					case talkOut <- hotkey.Event{Kind: hotkey.Cancel, Code: talkCode, At: ev.At}:
-					case <-ctx.Done():
-						return
-					}
-					suppressTalkUp = true
-					handleSelectSlot(reg, slot, notifyOn)
-				}
-			}
-		}
-	}
-}
-
-func handleAction(ctx context.Context, action hotkey.Action, mic *audio.Capture, asrClient *asr.Client, reg *output.Registry, cfg *config.Config, state *daemonState, workWG *sync.WaitGroup) {
-	switch action {
-	case hotkey.ActionStartCapture:
-		if err := mic.Start(); err != nil {
-			slog.Error("audio start", "err", err)
-			state.stopRecording()
-			state.setState(hotkey.StateIdle.String())
+func routeCommand(ctx context.Context, cmd hotkey.Command, recorderCommands chan<- recorderCommand, reg *output.Registry, notifier *notify.Worker, state *daemonState, lockedCaptureActive *bool) {
+	switch cmd.Action {
+	case hotkey.ActionStartMomentaryCapture:
+		*lockedCaptureActive = false
+		sendRecorderCommand(ctx, recorderCommands, hotkey.ActionStartMomentaryCapture)
+	case hotkey.ActionToggleLockedCapture:
+		if *lockedCaptureActive {
+			*lockedCaptureActive = false
+			sendRecorderCommand(ctx, recorderCommands, hotkey.ActionFinalizeCapture)
 		} else {
-			state.startRecording()
+			*lockedCaptureActive = true
+			sendRecorderCommand(ctx, recorderCommands, hotkey.ActionStartMomentaryCapture)
 		}
-	case hotkey.ActionStopAndSend:
-		state.stopRecording()
-		state.setState("Transcribing")
-		pcm, err := mic.Stop()
-		if err != nil {
-			slog.Error("audio stop", "err", err)
-			state.setState(hotkey.StateIdle.String())
-			return
-		}
-		if len(pcm) == 0 {
-			slog.Warn("empty audio buffer")
-			state.setState(hotkey.StateIdle.String())
-			return
-		}
-		workWG.Add(1)
-		go func() {
-			defer workWG.Done()
-			transcribeAndSend(ctx, pcm, asrClient, reg, cfg, state)
-		}()
+	case hotkey.ActionFinalizeCapture:
+		*lockedCaptureActive = false
+		sendRecorderCommand(ctx, recorderCommands, hotkey.ActionFinalizeCapture)
 	case hotkey.ActionDiscardCapture:
-		_ = mic.Discard()
-		state.stopRecording()
+		*lockedCaptureActive = false
+		sendRecorderCommand(ctx, recorderCommands, hotkey.ActionDiscardCapture)
+	case hotkey.ActionSelectSlot:
+		handleSelectSlot(reg, cmd.Slot, notifier)
+	case hotkey.ActionReportActiveStream:
+		handleTargetNotification(reg, notifier)
+	case hotkey.ActionCycleStream:
+		handleCycle(reg)
+	}
+	if state.State() == "" {
 		state.setState(hotkey.StateIdle.String())
 	}
 }
 
-func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, reg *output.Registry, cfg *config.Config, state *daemonState) {
-	defer state.setState(hotkey.StateIdle.String())
-
-	audioMs := len(pcm) * 1000 / 2 / cfg.Audio.SampleRate
-
-	now := time.Now().UTC()
-	rec := persist.Record{
-		Timestamp: now,
-		AudioMs:   audioMs,
-		Mode:      ipc.TargetTypePTY,
+func sendRecorderCommand(ctx context.Context, ch chan<- recorderCommand, action hotkey.Action) {
+	select {
+	case ch <- recorderCommand{action: action}:
+	case <-ctx.Done():
+	default:
+		slog.Warn("recorder command queue full", "action", action)
 	}
+}
 
-	if audioPath, err := persist.SavePCM16WAV(cfg.Storage.TranscriptsDir, now, pcm, cfg.Audio.SampleRate); err != nil {
-		slog.Error("save raw audio", "err", err)
-		rec.AudioSaveError = err.Error()
-	} else {
-		rec.AudioPath = audioPath
+func recorderLoop(ctx context.Context, mic *audio.Capture, store *persist.CaptureStore, cfg *config.Config, state *daemonState, commands <-chan recorderCommand, finalized chan<- persist.CaptureMeta) {
+	var current *persist.CaptureWriter
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case cmd := <-commands:
+			switch cmd.action {
+			case hotkey.ActionStartMomentaryCapture:
+				if current != nil {
+					slog.Warn("capture already active", "capture_id", current.CaptureID())
+					continue
+				}
+				writer, err := store.NewCapture(cfg.Audio.SampleRate)
+				if err != nil {
+					slog.Error("capture spool start", "err", err)
+					state.setState(hotkey.StateIdle.String())
+					continue
+				}
+				if err := mic.StartWithChunks(func(chunk []byte) {
+					if err := writer.WriteChunk(chunk); err != nil {
+						slog.Error("capture spool write", "capture_id", writer.CaptureID(), "err", err)
+					}
+				}); err != nil {
+					slog.Error("audio start", "err", err)
+					meta, failErr := writer.Fail(persist.StageRecording, err, false)
+					if failErr == nil {
+						state.updateJob(meta)
+					}
+					state.stopRecording()
+					state.setState(hotkey.StateIdle.String())
+					continue
+				}
+				current = writer
+				state.startRecording()
+				state.updateJob(writer.Meta())
+			case hotkey.ActionFinalizeCapture:
+				if current == nil {
+					continue
+				}
+				if meta, err := current.MarkStopping(); err == nil {
+					state.stopRecording()
+					state.updateJob(meta)
+				}
+				pcm, err := mic.Stop()
+				if err != nil {
+					slog.Error("audio stop", "err", err)
+					meta, failErr := current.Fail(persist.StageStoppingCapture, err, true)
+					if failErr == nil {
+						state.updateJob(meta)
+						saveCaptureRecord(cfg.Storage.TranscriptsDir, meta, false, err)
+					}
+					current = nil
+					continue
+				}
+				if len(pcm) == 0 {
+					err := fmt.Errorf("empty audio buffer")
+					slog.Warn("empty audio buffer")
+					meta, failErr := current.Fail(persist.StageSavingAudio, err, false)
+					if failErr == nil {
+						state.updateJob(meta)
+						saveCaptureRecord(cfg.Storage.TranscriptsDir, meta, false, err)
+					}
+					current = nil
+					continue
+				}
+				if meta, err := store.Update(current.CaptureID(), func(meta *persist.CaptureMeta) {
+					meta.Stage = persist.StageSavingAudio
+				}); err == nil {
+					state.updateJob(meta)
+				}
+				meta, err := current.FinalizeWithPCM(pcm)
+				if err != nil {
+					slog.Error("finalize audio", "err", err)
+					meta, failErr := current.Fail(persist.StageSavingAudio, err, true)
+					if failErr == nil {
+						state.updateJob(meta)
+						saveCaptureRecord(cfg.Storage.TranscriptsDir, meta, false, err)
+					}
+					current = nil
+					continue
+				}
+				state.updateJob(meta)
+				current = nil
+				select {
+				case finalized <- meta:
+				case <-ctx.Done():
+					return
+				}
+			case hotkey.ActionDiscardCapture:
+				if current == nil {
+					state.stopRecording()
+					state.setState(hotkey.StateIdle.String())
+					continue
+				}
+				err := fmt.Errorf("discarded by user")
+				_ = mic.Discard()
+				meta, failErr := current.Fail(persist.StageRecording, err, false)
+				if failErr == nil {
+					state.updateJob(meta)
+				}
+				current = nil
+				state.stopRecording()
+				state.setState(hotkey.StateIdle.String())
+			}
+		}
 	}
+}
 
-	tctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Server.TimeoutMs)*time.Millisecond)
-	defer cancel()
-	result, err := asrClient.Transcribe(tctx, pcm, cfg.Audio.SampleRate)
+func finalizerLoop(ctx context.Context, store *persist.CaptureStore, state *daemonState, finalized <-chan persist.CaptureMeta, asrJobs chan<- string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case meta := <-finalized:
+			queued, err := store.Update(meta.CaptureID, func(next *persist.CaptureMeta) {
+				next.Stage = persist.StageQueuedForASR
+			})
+			if err != nil {
+				slog.Error("queue asr", "capture_id", meta.CaptureID, "err", err)
+				continue
+			}
+			state.updateJob(queued)
+			select {
+			case asrJobs <- queued.CaptureID:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func asrWorkerLoop(ctx context.Context, store *persist.CaptureStore, asrClient *asr.Client, cfg *config.Config, state *daemonState, jobs <-chan string, deliveryJobs chan<- string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case captureID := <-jobs:
+			meta, err := store.Update(captureID, func(next *persist.CaptureMeta) {
+				next.Stage = persist.StageTranscribing
+				next.Error = ""
+				next.FailedStage = ""
+				next.Retryable = false
+			})
+			if err != nil {
+				slog.Error("start asr job", "capture_id", captureID, "err", err)
+				continue
+			}
+			state.updateJob(meta)
+			pcm, err := os.ReadFile(meta.PCMPath)
+			if err != nil {
+				failCapture(store, state, cfg.Storage.TranscriptsDir, meta.CaptureID, persist.StageTranscribing, err, true)
+				continue
+			}
+			tctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.Server.TimeoutMs)*time.Millisecond)
+			result, err := asrClient.Transcribe(tctx, pcm, meta.SampleRate)
+			cancel()
+			if err != nil {
+				slog.Error("transcribe", "capture_id", meta.CaptureID, "err", err)
+				failCapture(store, state, cfg.Storage.TranscriptsDir, meta.CaptureID, persist.StageTranscribing, err, true)
+				continue
+			}
+			transcribed, err := store.Update(meta.CaptureID, func(next *persist.CaptureMeta) {
+				next.Stage = persist.StageTranscribed
+				next.Transcript = result.Text
+				next.Raw = result.Raw
+				next.InferenceMs = result.Ms
+			})
+			if err != nil {
+				slog.Error("save transcription", "capture_id", meta.CaptureID, "err", err)
+				continue
+			}
+			state.updateJob(transcribed)
+			state.setLastTranscript(result.Text)
+			select {
+			case deliveryJobs <- transcribed.CaptureID:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func deliveryWorkerLoop(ctx context.Context, store *persist.CaptureStore, reg *output.Registry, cfg *config.Config, state *daemonState, jobs <-chan string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case captureID := <-jobs:
+			meta, err := store.Read(captureID)
+			if err != nil {
+				slog.Error("read delivery job", "capture_id", captureID, "err", err)
+				continue
+			}
+			if meta.TargetRef == "" {
+				stream := reg.ActiveStream()
+				if stream == nil {
+					err := fmt.Errorf("no stream selected")
+					failCapture(store, state, cfg.Storage.TranscriptsDir, meta.CaptureID, persist.StageQueuedForDelivery, err, true)
+					continue
+				}
+				target := stream.Target
+				meta, err = store.Update(meta.CaptureID, func(next *persist.CaptureMeta) {
+					next.Stage = persist.StageQueuedForDelivery
+					next.TargetStream = daemonStreamLabel(*stream)
+					next.TargetType = target.TargetType
+					next.TargetRef = target.TargetRef
+				})
+				if err != nil {
+					slog.Error("queue delivery", "capture_id", captureID, "err", err)
+					continue
+				}
+				state.updateJob(meta)
+			}
+			meta, err = store.Update(meta.CaptureID, func(next *persist.CaptureMeta) {
+				next.Stage = persist.StageDelivering
+			})
+			if err != nil {
+				slog.Error("start delivery", "capture_id", captureID, "err", err)
+				continue
+			}
+			state.updateJob(meta)
+			target := ipc.Target{TargetType: meta.TargetType, TargetRef: meta.TargetRef}
+			if err := output.SendText(target, meta.Transcript); err != nil {
+				slog.Error("send text", "capture_id", meta.CaptureID, "target", meta.TargetRef, "err", err)
+				_ = reg.PruneDead()
+				failCapture(store, state, cfg.Storage.TranscriptsDir, meta.CaptureID, persist.StageDelivering, err, true)
+				continue
+			}
+			delivered, err := store.Update(meta.CaptureID, func(next *persist.CaptureMeta) {
+				next.Stage = persist.StageDelivered
+				next.DeliveredAt = time.Now().UTC()
+				next.Error = ""
+				next.FailedStage = ""
+				next.Retryable = false
+			})
+			if err != nil {
+				slog.Error("mark delivered", "capture_id", meta.CaptureID, "err", err)
+				continue
+			}
+			saveCaptureRecord(cfg.Storage.TranscriptsDir, delivered, true, nil)
+			state.setLastTranscript(delivered.Transcript)
+			state.removeJob(delivered.CaptureID)
+			slog.Info("dictated", "capture_id", delivered.CaptureID, "stream", delivered.TargetStream, "target", delivered.TargetRef, "chars", len(delivered.Transcript), "audio_ms", delivered.AudioMs, "infer_ms", delivered.InferenceMs)
+		}
+	}
+}
+
+func recoverDurableWorkflow(ctx context.Context, store *persist.CaptureStore, state *daemonState, asrJobs chan<- string, deliveryJobs chan<- string) error {
+	plan, err := store.Recover(2)
 	if err != nil {
-		slog.Error("transcribe", "err", err)
-		rec.Success = false
-		rec.Error = err.Error()
-		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
+		return err
+	}
+	for _, meta := range plan.Failed {
+		state.updateJob(meta)
+	}
+	for _, meta := range plan.ASR {
+		state.updateJob(meta)
+		select {
+		case asrJobs <- meta.CaptureID:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	for _, meta := range plan.Delivery {
+		state.updateJob(meta)
+		select {
+		case deliveryJobs <- meta.CaptureID:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if len(plan.ASR)+len(plan.Delivery)+len(plan.Failed) > 0 {
+		slog.Info("recovered durable captures", "asr", len(plan.ASR), "delivery", len(plan.Delivery), "failed", len(plan.Failed))
+	}
+	return nil
+}
+
+func failCapture(store *persist.CaptureStore, state *daemonState, transcriptsDir, captureID, stage string, err error, retryable bool) {
+	meta, failErr := store.Fail(captureID, stage, err, retryable)
+	if failErr != nil {
+		slog.Error("mark capture failed", "capture_id", captureID, "err", failErr)
 		return
 	}
-	rec.Transcript = result.Text
-	rec.Raw = result.Raw
-	rec.InferenceMs = result.Ms
+	state.updateJob(meta)
+	saveCaptureRecord(transcriptsDir, meta, false, err)
+}
 
-	stream := reg.ActiveStream()
-	if stream == nil {
-		rec.Mode = "noop"
-		rec.Error = "no stream selected"
-		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
+func saveCaptureRecord(dir string, meta persist.CaptureMeta, success bool, failure error) {
+	if strings.TrimSpace(dir) == "" || meta.CaptureID == "" {
 		return
 	}
-	target := stream.Target
-	rec.TargetStream = stream.Name
-	rec.TargetType = target.TargetType
-	rec.TargetRef = target.TargetRef
+	errText := meta.Error
+	if failure != nil {
+		errText = failure.Error()
+	}
+	mode := ipc.TargetTypePTY
+	if meta.TargetRef == "" {
+		mode = "noop"
+	}
+	rec := persist.Record{
+		Timestamp:    meta.CreatedAt,
+		MessageID:    persist.RecordMessageID(persist.Record{CaptureID: meta.CaptureID}),
+		CaptureID:    meta.CaptureID,
+		Stage:        meta.Stage,
+		AudioMs:      meta.AudioMs,
+		AudioPath:    meta.AudioPath,
+		Transcript:   meta.Transcript,
+		Raw:          meta.Raw,
+		TargetStream: meta.TargetStream,
+		TargetType:   meta.TargetType,
+		TargetRef:    meta.TargetRef,
+		Mode:         mode,
+		Success:      success,
+		Error:        errText,
+		InferenceMs:  meta.InferenceMs,
+		Type:         "transcript",
+	}
+	if rec.Timestamp.IsZero() {
+		rec.Timestamp = time.Now().UTC()
+	}
+	if err := persist.Save(dir, rec); err != nil {
+		slog.Error("save transcript history", "capture_id", meta.CaptureID, "err", err)
+	}
+}
 
-	if err := output.SendText(target, result.Text); err != nil {
-		slog.Error("send text", "err", err)
-		_ = reg.PruneDead()
-		rec.Error = err.Error()
-		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
+func closeCaptureWithTimeout(mic *audio.Capture, timeout time.Duration) {
+	if mic == nil {
 		return
 	}
-
-	rec.Success = true
-	_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
-	state.setLastTranscript(result.Text)
-	slog.Info("dictated", "stream", stream.Name, "target", target.TargetRef, "chars", len(result.Text), "audio_ms", audioMs, "infer_ms", result.Ms)
+	done := make(chan struct{})
+	go func() {
+		mic.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("timed out closing audio capture", "timeout", timeout)
+	}
 }
 
 func handleCycle(reg *output.Registry) {
@@ -477,25 +725,38 @@ func handleCycle(reg *output.Registry) {
 	slog.Info("cycled", "active", active)
 }
 
-func handleSelectSlot(reg *output.Registry, slot int, notifyOn bool) {
+func daemonStreamLabel(stream ipc.Stream) string {
+	if strings.TrimSpace(stream.Name) != "" {
+		return strings.TrimSpace(stream.Name)
+	}
+	if stream.Slot > 0 {
+		return fmt.Sprintf("slot %d", stream.Slot)
+	}
+	if stream.ID != "" {
+		return stream.ID
+	}
+	return "(unnamed)"
+}
+
+func handleSelectSlot(reg *output.Registry, slot int, notifier *notify.Worker) {
 	active, err := reg.SelectSlot(slot)
 	if err != nil {
-		if notifyOn {
-			notifySend(fmt.Sprintf("stt: slot %d failed", slot), err.Error())
+		if notifier != nil {
+			notifier.Send(fmt.Sprintf("stt: slot %d failed", slot), err.Error())
 		}
 		slog.Warn("select slot", "slot", slot, "err", err)
 		return
 	}
-	if notifyOn {
-		notifySend(fmt.Sprintf("stt slot %d → %s", slot, active), "")
+	if notifier != nil {
+		notifier.Send(fmt.Sprintf("stt slot %d -> %s", slot, active), "")
 	}
 	slog.Info("selected slot", "slot", slot, "active", active)
 }
 
-func handleTargetNotification(reg *output.Registry, notifyOn bool) {
+func handleTargetNotification(reg *output.Registry, notifier *notify.Worker) {
 	title, body := currentTargetNotification(reg)
-	if notifyOn {
-		notifySend(title, body)
+	if notifier != nil {
+		notifier.Send(title, body)
 	}
 	slog.Info("reported target", "body", body)
 }

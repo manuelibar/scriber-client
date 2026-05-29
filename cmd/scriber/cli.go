@@ -249,6 +249,57 @@ func pasteCmd() *cobra.Command {
 	return c
 }
 
+func redeemCmd() *cobra.Command {
+	var from string
+	var to string
+	var last int
+	var separator string
+	c := &cobra.Command{
+		Use:   "redeem --to DEST --last N [--from SOURCE]",
+		Short: "Move recent transcript ownership to another stream and paste it there",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if to == "" {
+				return fmt.Errorf("--to is required")
+			}
+			if last <= 0 {
+				return fmt.Errorf("--last must be positive")
+			}
+			cli := ipc.NewClient(config.SocketPath())
+			if from == "" {
+				monitor, err := cli.Monitor()
+				if err != nil {
+					return err
+				}
+				from = monitor.Active
+				if from == "" && monitor.ActiveSlot > 0 {
+					from = fmt.Sprintf("slot %d", monitor.ActiveSlot)
+				}
+				if from == "" {
+					return fmt.Errorf("--from omitted but no active stream is selected")
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "source stream defaulted to active stream %q\n", from)
+			}
+			resp, err := cli.Redeem(ipc.RedeemRequest{
+				From:      from,
+				To:        to,
+				Last:      last,
+				Separator: decodeSeparator(separator),
+			})
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "redeemed %d message(s) from %q to %q and pasted %d chars\n", len(resp.MessageIDs), resp.From, resp.To, resp.Chars)
+			return nil
+		},
+	}
+	c.Flags().StringVar(&from, "from", "", "source stream; defaults visibly to the active stream")
+	c.Flags().StringVar(&to, "to", "", "destination stream")
+	c.Flags().IntVar(&last, "last", 1, "number of latest delivered messages to redeem")
+	c.Flags().StringVar(&separator, "separator", " ", "text inserted between messages; supports \\n, \\r, and \\t escapes")
+	return c
+}
+
 func decodeSeparator(s string) string {
 	replacer := strings.NewReplacer(`\n`, "\n", `\r`, "\r", `\t`, "\t")
 	return replacer.Replace(s)
@@ -257,6 +308,7 @@ func decodeSeparator(s string) string {
 func monitorCmd() *cobra.Command {
 	var interval time.Duration
 	var once bool
+	var porcelain bool
 	var historyLimit int
 	var historyStream string
 	c := &cobra.Command{
@@ -270,6 +322,14 @@ func monitorCmd() *cobra.Command {
 				return fmt.Errorf("history-limit must be zero or greater")
 			}
 			cli := ipc.NewClient(config.SocketPath())
+			if porcelain {
+				monitor, err := cli.Monitor()
+				if err != nil {
+					return err
+				}
+				fmt.Print(renderMonitorPorcelain(monitor))
+				return nil
+			}
 			if once {
 				monitor, err := cli.Monitor()
 				if err != nil {
@@ -321,6 +381,7 @@ func monitorCmd() *cobra.Command {
 	}
 	c.Flags().DurationVar(&interval, "interval", 250*time.Millisecond, "refresh interval")
 	c.Flags().BoolVar(&once, "once", false, "print one combined snapshot and exit")
+	c.Flags().BoolVar(&porcelain, "porcelain", false, "print one stable machine-readable snapshot and exit")
 	c.Flags().IntVar(&historyLimit, "history-limit", 200, "session transcript ring size; 0 hides monitor-session history")
 	c.Flags().StringVar(&historyStream, "history-stream", "", "only show monitor-session history for a specific stream name")
 	return c
@@ -397,6 +458,106 @@ func renderMonitorSnapshot(monitor *ipc.MonitorResponse, color bool) string {
 	return renderMonitorSnapshotWithOptions(monitor, color, monitorRenderOptions{})
 }
 
+func renderMonitorPorcelain(monitor *ipc.MonitorResponse) string {
+	if monitor == nil {
+		return ""
+	}
+	stats := monitorSessionStats(monitor.Streams, monitor.Transcripts)
+	var b strings.Builder
+	fmt.Fprintf(&b, "monitor version=1 state=%s pid=%d server_ok=%t active=%s active_slot=%d recording_ms=%d audio_level=%.6f stream_count=%d transcript_count=%d transcript_tokens=%d transcript_audio_ms=%d\n",
+		porcelainQuote(monitor.State),
+		monitor.PID,
+		monitor.ServerOK,
+		porcelainQuote(monitor.Active),
+		monitor.ActiveSlot,
+		monitor.RecordingMs,
+		monitor.AudioLevel,
+		len(monitor.Streams),
+		stats.TotalEntries,
+		stats.TotalTokens,
+		stats.TotalAudioMs,
+	)
+	if !monitor.LastTranscriptAt.IsZero() || monitor.LastTranscript != "" {
+		fmt.Fprintf(&b, "last_transcript ts=%s text=%s\n",
+			porcelainTime(monitor.LastTranscriptAt),
+			porcelainQuote(monitor.LastTranscript),
+		)
+	}
+	for i, stream := range monitor.Streams {
+		streamStats := stats.ByStream[streamKey(stream)]
+		fmt.Fprintf(&b, "stream index=%d active=%t id=%s slot=%d name=%s status=%s target_type=%s target_ref=%s target_label=%s target_tty=%s target_cwd=%s target_pid=%d attached_at=%s last_used_at=%s target_attached_at=%s target_last_seen_at=%s transcript_count=%d transcript_tokens=%d transcript_audio_ms=%d\n",
+			i,
+			streamIsActive(stream, monitor.Active, monitor.ActiveSlot),
+			porcelainQuote(stream.ID),
+			stream.Slot,
+			porcelainQuote(stream.Name),
+			porcelainQuote(stream.Status),
+			porcelainQuote(stream.Target.TargetType),
+			porcelainQuote(stream.Target.TargetRef),
+			porcelainQuote(stream.Target.Label),
+			porcelainQuote(stream.Target.TTY),
+			porcelainQuote(stream.Target.CWD),
+			stream.Target.PID,
+			porcelainTime(stream.AttachedAt),
+			porcelainTime(stream.LastUsedAt),
+			porcelainTime(stream.Target.AttachedAt),
+			porcelainTime(stream.Target.LastSeenAt),
+			streamStats.Entries,
+			streamStats.Tokens,
+			streamStats.AudioMs,
+		)
+	}
+	for i, job := range monitor.Jobs {
+		fmt.Fprintf(&b, "job index=%d capture_id=%s stage=%s age_ms=%d updated_ago_ms=%d audio_path=%s target_stream=%s target_type=%s target_ref=%s retryable=%t error=%s\n",
+			i,
+			porcelainQuote(job.CaptureID),
+			porcelainQuote(job.Stage),
+			job.AgeMs,
+			job.UpdatedAgoMs,
+			porcelainQuote(job.AudioPath),
+			porcelainQuote(job.TargetStream),
+			porcelainQuote(job.TargetType),
+			porcelainQuote(job.TargetRef),
+			job.Retryable,
+			porcelainQuote(job.Error),
+		)
+	}
+	for i, entry := range monitor.Transcripts {
+		fmt.Fprintf(&b, "transcript index=%d ts=%s stream=%s target_type=%s target_ref=%s mode=%s success=%t audio_ms=%d inference_ms=%d tokens=%d error=%s text=%s message_id=%s owned_stream=%s capture_id=%s stage=%s redeemed_from=%s redeemed_to=%s\n",
+			i,
+			porcelainTime(entry.Timestamp),
+			porcelainQuote(entry.Stream),
+			porcelainQuote(entry.TargetType),
+			porcelainQuote(entry.TargetRef),
+			porcelainQuote(entry.Mode),
+			entry.Success,
+			entry.AudioMs,
+			entry.InferenceMs,
+			estimateTokens(entry.Transcript),
+			porcelainQuote(entry.Error),
+			porcelainQuote(entry.Transcript),
+			porcelainQuote(entry.MessageID),
+			porcelainQuote(entry.OwnedStream),
+			porcelainQuote(entry.CaptureID),
+			porcelainQuote(entry.Stage),
+			porcelainQuote(entry.RedeemedFrom),
+			porcelainQuote(entry.RedeemedTo),
+		)
+	}
+	return b.String()
+}
+
+func porcelainQuote(s string) string {
+	return strconv.Quote(s)
+}
+
+func porcelainTime(t time.Time) string {
+	if t.IsZero() {
+		return `""`
+	}
+	return strconv.Quote(t.UTC().Format(time.RFC3339Nano))
+}
+
 func renderMonitorSnapshotWithOptions(monitor *ipc.MonitorResponse, color bool, opts monitorRenderOptions) string {
 	if monitor == nil {
 		return ""
@@ -423,6 +584,22 @@ func renderMonitorSnapshotWithOptions(monitor *ipc.MonitorResponse, color bool, 
 	fmt.Fprintf(&header, "active target: %s\n", formatMonitorTarget(monitor.Streams, active, activeSlot, color))
 	fmt.Fprintf(&header, "recording:     %s\n", formatRecordingMs(monitor.RecordingMs))
 	fmt.Fprintf(&header, "audio level:   %s %.4f\n", levelMeter(monitor.AudioLevel, 20), monitor.AudioLevel)
+	if len(monitor.Jobs) > 0 {
+		header.WriteString("jobs:\n")
+		for _, job := range monitor.Jobs {
+			fmt.Fprintf(&header, "  capture=%s stage=%s age=%s updated=%s target=%s retryable=%t\n",
+				compactMonitorText(job.CaptureID, 18),
+				job.Stage,
+				formatDurationShort(time.Duration(job.AgeMs)*time.Millisecond),
+				formatDurationShort(time.Duration(job.UpdatedAgoMs)*time.Millisecond),
+				formatMonitorJobTarget(job),
+				job.Retryable,
+			)
+			if job.Error != "" {
+				fmt.Fprintf(&header, "    error: %s\n", compactMonitorText(job.Error, 160))
+			}
+		}
+	}
 	fmt.Fprintf(&header, "stream count:  %d\n", len(monitor.Streams))
 	if !opts.SessionStart.IsZero() {
 		fmt.Fprintf(&header, "monitor up:    %s\n", formatDurationShort(now.Sub(opts.SessionStart)))
@@ -489,7 +666,10 @@ func transcriptGroups(streams []ipc.Stream, entries []ipc.TranscriptEntry) (map[
 	var unmatched []ipc.TranscriptEntry
 	for _, entry := range entries {
 		key := ""
-		if entry.TargetRef != "" {
+		if entry.OwnedStream != "" {
+			key = streamByName[entry.OwnedStream]
+		}
+		if key == "" && entry.TargetRef != "" {
 			key = streamByRef[entry.TargetRef]
 		}
 		if key == "" && entry.Stream != "" {
@@ -536,7 +716,10 @@ func monitorSessionStats(streams []ipc.Stream, entries []ipc.TranscriptEntry) mo
 		stats.TotalTokens += tokens
 		stats.TotalAudioMs += entry.AudioMs
 		key := ""
-		if entry.TargetRef != "" {
+		if entry.OwnedStream != "" {
+			key = streamByName[entry.OwnedStream]
+		}
+		if key == "" && entry.TargetRef != "" {
 			key = streamByRef[entry.TargetRef]
 		}
 		if key == "" && entry.Stream != "" {
@@ -613,7 +796,20 @@ func formatTranscriptEntry(entry ipc.TranscriptEntry, indent string, color bool)
 	if entry.Error != "" {
 		fmt.Fprintf(&b, "%serror: %s\n", indent, entry.Error)
 	}
+	if entry.RedeemedFrom != "" && entry.RedeemedTo != "" {
+		fmt.Fprintf(&b, "%sredeemed: %s -> %s\n", indent, entry.RedeemedFrom, entry.RedeemedTo)
+	}
 	return b.String()
+}
+
+func formatMonitorJobTarget(job ipc.JobSnapshot) string {
+	if job.TargetStream != "" {
+		return job.TargetStream
+	}
+	if job.TargetRef != "" {
+		return job.TargetRef
+	}
+	return "-"
 }
 
 func joinMonitorSections(header, history string, opts monitorRenderOptions) string {

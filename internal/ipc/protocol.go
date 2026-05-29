@@ -91,16 +91,37 @@ type CycleResponse struct {
 }
 
 type TranscriptEntry struct {
-	Timestamp   time.Time `json:"ts"`
-	AudioMs     int       `json:"audio_ms,omitempty"`
-	Stream      string    `json:"stream,omitempty"`
-	TargetType  string    `json:"target_type,omitempty"`
-	TargetRef   string    `json:"target_ref,omitempty"`
-	Mode        string    `json:"mode,omitempty"`
-	Success     bool      `json:"success"`
-	Error       string    `json:"error,omitempty"`
-	InferenceMs int       `json:"inference_ms,omitempty"`
-	Transcript  string    `json:"transcript"`
+	Timestamp    time.Time `json:"ts"`
+	MessageID    string    `json:"message_id,omitempty"`
+	AudioMs      int       `json:"audio_ms,omitempty"`
+	Stream       string    `json:"stream,omitempty"`
+	OwnedStream  string    `json:"owned_stream,omitempty"`
+	RedeemedFrom string    `json:"redeemed_from,omitempty"`
+	RedeemedTo   string    `json:"redeemed_to,omitempty"`
+	CaptureID    string    `json:"capture_id,omitempty"`
+	Stage        string    `json:"stage,omitempty"`
+	TargetType   string    `json:"target_type,omitempty"`
+	TargetRef    string    `json:"target_ref,omitempty"`
+	Mode         string    `json:"mode,omitempty"`
+	Success      bool      `json:"success"`
+	Error        string    `json:"error,omitempty"`
+	InferenceMs  int       `json:"inference_ms,omitempty"`
+	Transcript   string    `json:"transcript"`
+}
+
+type JobSnapshot struct {
+	CaptureID    string    `json:"capture_id"`
+	Stage        string    `json:"stage"`
+	AgeMs        int       `json:"age_ms"`
+	UpdatedAgoMs int       `json:"updated_ago_ms"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	AudioPath    string    `json:"audio_path,omitempty"`
+	TargetStream string    `json:"target_stream,omitempty"`
+	TargetType   string    `json:"target_type,omitempty"`
+	TargetRef    string    `json:"target_ref,omitempty"`
+	Error        string    `json:"error,omitempty"`
+	Retryable    bool      `json:"retryable,omitempty"`
 }
 
 type MonitorResponse struct {
@@ -110,6 +131,7 @@ type MonitorResponse struct {
 	ActiveSlot              int               `json:"active_slot,omitempty"`
 	RecordingMs             int               `json:"recording_ms,omitempty"`
 	AudioLevel              float64           `json:"audio_level,omitempty"`
+	Jobs                    []JobSnapshot     `json:"jobs,omitempty"`
 	Streams                 []Stream          `json:"streams"`
 	Transcripts             []TranscriptEntry `json:"transcripts,omitempty"`
 	TranscriptHistoryLoaded bool              `json:"transcript_history_loaded,omitempty"`
@@ -130,6 +152,21 @@ type PasteRequest struct {
 type PasteResponse struct {
 	Stream string `json:"stream"`
 	Chars  int    `json:"chars"`
+}
+
+type RedeemRequest struct {
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Last      int    `json:"last"`
+	Separator string `json:"separator,omitempty"`
+}
+
+type RedeemResponse struct {
+	From       string   `json:"from"`
+	To         string   `json:"to"`
+	MessageIDs []string `json:"message_ids"`
+	Chars      int      `json:"chars"`
+	Text       string   `json:"text,omitempty"`
 }
 
 type InjectRequest struct {

@@ -24,7 +24,7 @@ func TestRootCommandHasStreamCommands(t *testing.T) {
 	for _, cmd := range root.Commands() {
 		commands[cmd.Name()] = true
 	}
-	for _, want := range []string{"start", "shutdown", "attach", "stream", "select", "cycle", "paste", "history", "monitor", "doctor"} {
+	for _, want := range []string{"start", "shutdown", "attach", "stream", "select", "cycle", "paste", "redeem", "history", "monitor", "doctor"} {
 		if !commands[want] {
 			t.Fatalf("root command missing %q; got %v", want, commands)
 		}
@@ -118,6 +118,18 @@ func TestPasteUsage(t *testing.T) {
 	}
 }
 
+func TestRedeemUsage(t *testing.T) {
+	redeem := redeemCmd()
+	if redeem.Use != "redeem --to DEST --last N [--from SOURCE]" {
+		t.Fatalf("redeem Use = %q, want redeem --to DEST --last N [--from SOURCE]", redeem.Use)
+	}
+	for _, flag := range []string{"from", "to", "last", "separator"} {
+		if redeem.Flags().Lookup(flag) == nil {
+			t.Fatalf("redeem command missing %q flag", flag)
+		}
+	}
+}
+
 func TestHistoryPruneUsage(t *testing.T) {
 	history := historyCmd()
 	commands := map[string]bool{}
@@ -143,12 +155,83 @@ func TestStreamSetSlotUsage(t *testing.T) {
 	}
 }
 
+func TestMonitorUsageIncludesPorcelain(t *testing.T) {
+	monitor := monitorCmd()
+	if monitor.Flags().Lookup("porcelain") == nil {
+		t.Fatalf("monitor command missing porcelain flag")
+	}
+}
+
 func TestLevelMeter(t *testing.T) {
 	if got := levelMeter(0, 5); got != "[-----]" {
 		t.Fatalf("levelMeter(0, 5) = %q", got)
 	}
 	if got := levelMeter(1, 5); got != "[#####]" {
 		t.Fatalf("levelMeter(1, 5) = %q", got)
+	}
+}
+
+func TestRenderMonitorPorcelain(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	monitor := &ipc.MonitorResponse{
+		State:            "Transcribing",
+		PID:              1234,
+		Active:           "kb",
+		ActiveSlot:       1,
+		RecordingMs:      2500,
+		AudioLevel:       0.25,
+		LastTranscript:   "hello\nworld",
+		LastTranscriptAt: at,
+		ServerOK:         true,
+		Transcripts: []ipc.TranscriptEntry{
+			{
+				Timestamp:   at,
+				Stream:      "kb",
+				TargetType:  ipc.TargetTypePTY,
+				TargetRef:   "pty-1",
+				Mode:        "pty",
+				Success:     true,
+				AudioMs:     3000,
+				InferenceMs: 75,
+				Transcript:  "hello\nworld",
+			},
+		},
+		Streams: []ipc.Stream{
+			{
+				ID:         "stream_kb",
+				Name:       "kb",
+				Slot:       1,
+				Status:     ipc.StreamStatusActive,
+				AttachedAt: at,
+				LastUsedAt: at.Add(time.Second),
+				Target: ipc.Target{
+					TargetType: ipc.TargetTypePTY,
+					TargetRef:  "pty-1",
+					Label:      "kb",
+					TTY:        "/dev/pts/1",
+					CWD:        "/tmp/a b",
+					PID:        4321,
+					AttachedAt: at,
+					LastSeenAt: at.Add(2 * time.Second),
+				},
+			},
+		},
+	}
+
+	got := renderMonitorPorcelain(monitor)
+	for _, want := range []string{
+		`monitor version=1 state="Transcribing" pid=1234 server_ok=true active="kb" active_slot=1 recording_ms=2500 audio_level=0.250000 stream_count=1 transcript_count=1 transcript_tokens=2 transcript_audio_ms=3000`,
+		`last_transcript ts="2026-01-02T03:04:05Z" text="hello\nworld"`,
+		`stream index=0 active=true id="stream_kb" slot=1 name="kb" status="active" target_type="pty" target_ref="pty-1" target_label="kb" target_tty="/dev/pts/1" target_cwd="/tmp/a b" target_pid=4321`,
+		`attached_at="2026-01-02T03:04:05Z" last_used_at="2026-01-02T03:04:06Z" target_attached_at="2026-01-02T03:04:05Z" target_last_seen_at="2026-01-02T03:04:07Z"`,
+		`transcript index=0 ts="2026-01-02T03:04:05Z" stream="kb" target_type="pty" target_ref="pty-1" mode="pty" success=true audio_ms=3000 inference_ms=75 tokens=2 error="" text="hello\nworld"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("porcelain output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "\033") {
+		t.Fatalf("porcelain output should not contain ANSI escapes:\n%s", got)
 	}
 }
 

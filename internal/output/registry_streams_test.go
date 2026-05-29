@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"scriber/internal/ipc"
 )
@@ -16,6 +17,10 @@ type fakeTargetBackend struct {
 func (f fakeTargetBackend) Alive(target ipc.Target) bool {
 	return f.alive[target.TargetRef]
 }
+
+type targetBackendFunc func(ipc.Target) bool
+
+func (f targetBackendFunc) Alive(target ipc.Target) bool { return f(target) }
 
 func newTestRegistry(t *testing.T, backend fakeTargetBackend) *Registry {
 	t.Helper()
@@ -165,6 +170,19 @@ func TestDetachBySlotRemovesUnnamedStream(t *testing.T) {
 	}
 	if active != "slot 2" || activeSlot != 2 {
 		t.Fatalf("active = %q slot=%d, want slot 2 / 2", active, activeSlot)
+	}
+}
+
+func TestStreamFindsUnnamedStreamBySlotLabel(t *testing.T) {
+	reg := newTestRegistry(t, fakeTargetBackend{alive: map[string]bool{
+		"/tmp/one.sock": true,
+	}})
+	if _, _, err := reg.Attach(&ipc.AttachRequest{TargetType: ipc.TargetTypePTY, TargetRef: "/tmp/one.sock"}); err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+	stream := reg.Stream("slot 1")
+	if stream == nil || stream.Slot != 1 || stream.Target.TargetRef != "/tmp/one.sock" {
+		t.Fatalf("Stream(slot 1) = %+v, want unnamed slot 1 stream", stream)
 	}
 }
 
@@ -323,5 +341,34 @@ func TestPruneDeadMarksStreamDeadWithoutDeletingName(t *testing.T) {
 	}
 	if active != "" || activeSlot != 0 {
 		t.Fatalf("active after pruning only live stream = %q slot=%d, want empty slot=0", active, activeSlot)
+	}
+}
+
+func TestPruneDeadDoesNotHoldRegistryLockDuringLivenessCheck(t *testing.T) {
+	var reg *Registry
+	backend := targetBackendFunc(func(target ipc.Target) bool {
+		done := make(chan struct{})
+		go func() {
+			_, _, _ = reg.Streams()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(100 * time.Millisecond):
+			t.Fatalf("registry lock was held while checking target liveness")
+		}
+		return true
+	})
+	var err error
+	reg, err = NewRegistryWithBackend(filepath.Join(t.TempDir(), "registry.json"), backend)
+	if err != nil {
+		t.Fatalf("NewRegistryWithBackend() error = %v", err)
+	}
+	if _, _, err := reg.Attach(attachReq("codex-main", "/tmp/codex.sock")); err != nil {
+		t.Fatalf("Attach() error = %v", err)
+	}
+
+	if dead := reg.PruneDead(); len(dead) != 0 {
+		t.Fatalf("PruneDead() = %v, want no dead streams", dead)
 	}
 }

@@ -53,7 +53,7 @@ func PTYSendText(socketPath, text string) error {
 		Timeout: 2 * time.Second,
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", socketPath)
+				return net.DialTimeout("unix", socketPath, 500*time.Millisecond)
 			},
 		},
 	}

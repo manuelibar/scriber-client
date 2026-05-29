@@ -15,6 +15,7 @@ type Hotkey struct {
 	TalkKey           string `yaml:"talk_key"`
 	CycleKey          string `yaml:"cycle_key"`
 	CancelKey         string `yaml:"cancel_key"`
+	QueryKey          string `yaml:"query_key"`
 	HoldThresholdMs   int    `yaml:"hold_threshold_ms"`
 	DoubleTapWindowMs int    `yaml:"double_tap_window_ms"`
 }
@@ -58,8 +59,9 @@ func Defaults() *Config {
 			TalkKey:           "KEY_RIGHTCTRL",
 			CycleKey:          "KEY_RIGHTMETA",
 			CancelKey:         "KEY_ESC",
+			QueryKey:          "KEY_F10",
 			HoldThresholdMs:   MinHoldThresholdMs,
-			DoubleTapWindowMs: 350,
+			DoubleTapWindowMs: 300,
 		},
 		Audio: Audio{
 			Device:     "default",

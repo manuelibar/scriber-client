@@ -28,6 +28,7 @@ type Registry interface {
 	SelectSlot(slot int) (string, error)
 	Cycle() (string, error)
 	SendTextToActive(text string) (string, error)
+	SendTextToStream(name, text string) (string, error)
 }
 
 // DaemonState reflects what the IPC server reports to `stt monitor`.
@@ -37,6 +38,7 @@ type DaemonState interface {
 	AudioLevel() float64
 	LastTranscript() (string, time.Time)
 	ServerOK() bool
+	Jobs() []JobSnapshot
 }
 
 type Server struct {
@@ -78,6 +80,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("/cycle", s.handleCycle)
 	mux.HandleFunc("/monitor", s.handleMonitor)
 	mux.HandleFunc("/paste", s.handlePaste)
+	mux.HandleFunc("/redeem", s.handleRedeem)
 	mux.HandleFunc("/shutdown", s.handleShutdown)
 
 	srv := &http.Server{Handler: mux}
@@ -223,6 +226,7 @@ func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
 		ActiveSlot:              activeSlot,
 		RecordingMs:             recordingMs,
 		AudioLevel:              s.dmn.AudioLevel(),
+		Jobs:                    s.dmn.Jobs(),
 		Streams:                 streams,
 		Transcripts:             transcripts,
 		TranscriptHistoryLoaded: historyLoaded,
@@ -268,7 +272,7 @@ func (s *Server) monitorTranscripts(query persist.HistoryQuery, load bool) ([]Tr
 		return nil, false, ""
 	}
 
-	records, err := persist.QueryHistory(s.transcriptsDir, query)
+	records, err := persist.QueryOwnedHistory(s.transcriptsDir, query)
 	if err != nil {
 		return nil, false, err.Error()
 	}
@@ -276,16 +280,22 @@ func (s *Server) monitorTranscripts(query persist.HistoryQuery, load bool) ([]Tr
 	out := make([]TranscriptEntry, 0, len(records))
 	for _, rec := range records {
 		out = append(out, TranscriptEntry{
-			Timestamp:   rec.Timestamp,
-			AudioMs:     rec.AudioMs,
-			Stream:      rec.TargetStream,
-			TargetType:  rec.TargetType,
-			TargetRef:   rec.TargetRef,
-			Mode:        rec.Mode,
-			Success:     rec.Success,
-			Error:       rec.Error,
-			InferenceMs: rec.InferenceMs,
-			Transcript:  rec.Transcript,
+			Timestamp:    rec.Timestamp,
+			MessageID:    persist.RecordMessageID(rec),
+			AudioMs:      rec.AudioMs,
+			Stream:       rec.TargetStream,
+			OwnedStream:  rec.OwnedStream,
+			RedeemedFrom: rec.RedeemedFrom,
+			RedeemedTo:   rec.RedeemedTo,
+			CaptureID:    rec.CaptureID,
+			Stage:        rec.Stage,
+			TargetType:   rec.TargetType,
+			TargetRef:    rec.TargetRef,
+			Mode:         rec.Mode,
+			Success:      rec.Success,
+			Error:        rec.Error,
+			InferenceMs:  rec.InferenceMs,
+			Transcript:   rec.Transcript,
 		})
 	}
 	return out, true, ""
@@ -303,6 +313,55 @@ func (s *Server) handlePaste(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, PasteResponse{Stream: stream, Chars: len(req.Text)})
+}
+
+func (s *Server) handleRedeem(w http.ResponseWriter, r *http.Request) {
+	if s.transcriptsDir == "" {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("transcript history unavailable"))
+		return
+	}
+	var req RedeemRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Last <= 0 {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("last must be positive"))
+		return
+	}
+	if req.From == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("from stream is required"))
+		return
+	}
+	if req.To == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("to stream is required"))
+		return
+	}
+	separator := req.Separator
+	if separator == "" {
+		separator = " "
+	}
+	selection, err := persist.SelectRedemptionMessages(s.transcriptsDir, req.From, req.Last, separator)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := s.reg.SendTextToStream(req.To, selection.Text); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	redemption, err := persist.SaveRedemption(s.transcriptsDir, req.From, req.To, selection.Messages, selection.Text)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, RedeemResponse{
+		From:       req.From,
+		To:         req.To,
+		MessageIDs: redemption.MessageIDs,
+		Chars:      len(selection.Text),
+		Text:       selection.Text,
+	})
 }
 
 func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {

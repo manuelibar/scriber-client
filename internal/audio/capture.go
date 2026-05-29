@@ -54,6 +54,12 @@ func (c *Capture) Close() {
 
 // Start begins capturing. Buffer cleared on each Start.
 func (c *Capture) Start() error {
+	return c.StartWithChunks(nil)
+}
+
+// StartWithChunks begins capturing and calls onChunk with each PCM chunk after it
+// has been copied out of the audio backend callback buffer.
+func (c *Capture) StartWithChunks(onChunk func([]byte)) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.capturing {
@@ -70,10 +76,15 @@ func (c *Capture) Start() error {
 
 	onRecv := func(_, samples []byte, _ uint32) {
 		level := RMSPCM16(samples)
+		chunk := make([]byte, len(samples))
+		copy(chunk, samples)
 		c.mu.Lock()
-		c.buf = append(c.buf, samples...)
+		c.buf = append(c.buf, chunk...)
 		c.level = level
 		c.mu.Unlock()
+		if onChunk != nil {
+			onChunk(chunk)
+		}
 	}
 	dev, err := malgo.InitDevice(c.ctx.Context, cfg, malgo.DeviceCallbacks{Data: onRecv})
 	if err != nil {

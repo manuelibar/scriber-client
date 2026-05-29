@@ -13,19 +13,36 @@ import (
 )
 
 type Record struct {
-	Timestamp      time.Time `json:"ts"`
-	AudioMs        int       `json:"audio_ms"`
-	AudioPath      string    `json:"audio_path,omitempty"`
-	AudioSaveError string    `json:"audio_save_error,omitempty"`
-	Transcript     string    `json:"transcript"`
-	Raw            string    `json:"raw,omitempty"`
-	TargetStream   string    `json:"target_stream,omitempty"`
-	TargetType     string    `json:"target_type,omitempty"`
-	TargetRef      string    `json:"target_ref,omitempty"`
-	Mode           string    `json:"mode"` // "pty" | "noop"
-	Success        bool      `json:"success"`
-	Error          string    `json:"error,omitempty"`
-	InferenceMs    int       `json:"inference_ms,omitempty"`
+	Timestamp      time.Time         `json:"ts"`
+	MessageID      string            `json:"message_id,omitempty"`
+	CaptureID      string            `json:"capture_id,omitempty"`
+	Stage          string            `json:"stage,omitempty"`
+	AudioMs        int               `json:"audio_ms"`
+	AudioPath      string            `json:"audio_path,omitempty"`
+	AudioSaveError string            `json:"audio_save_error,omitempty"`
+	Transcript     string            `json:"transcript"`
+	Raw            string            `json:"raw,omitempty"`
+	TargetStream   string            `json:"target_stream,omitempty"`
+	TargetType     string            `json:"target_type,omitempty"`
+	TargetRef      string            `json:"target_ref,omitempty"`
+	Mode           string            `json:"mode"` // "pty" | "noop"
+	Success        bool              `json:"success"`
+	Error          string            `json:"error,omitempty"`
+	InferenceMs    int               `json:"inference_ms,omitempty"`
+	Type           string            `json:"type,omitempty"` // "transcript" | "redemption"
+	Redemption     *RedemptionRecord `json:"redemption,omitempty"`
+	OwnedStream    string            `json:"owned_stream,omitempty"`
+	RedeemedFrom   string            `json:"redeemed_from,omitempty"`
+	RedeemedTo     string            `json:"redeemed_to,omitempty"`
+}
+
+type RedemptionRecord struct {
+	ID         string    `json:"id"`
+	At         time.Time `json:"at"`
+	FromStream string    `json:"from_stream"`
+	ToStream   string    `json:"to_stream"`
+	MessageIDs []string  `json:"message_ids"`
+	Text       string    `json:"text,omitempty"`
 }
 
 type HistoryQuery struct {
@@ -445,18 +462,25 @@ func SavePCM16WAV(dir string, ts time.Time, pcm []byte, sampleRate int) (string,
 		return "", err
 	}
 	path := filepath.Join(dir, recordName(ts, ".wav"))
-	data, err := wavData(pcm, sampleRate)
-	if err != nil {
-		return "", err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return "", fmt.Errorf("write %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := WritePCM16WAV(path, pcm, sampleRate); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+func WritePCM16WAV(path string, pcm []byte, sampleRate int) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := wavData(pcm, sampleRate)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	return os.Rename(tmp, path)
 }
 
 func recordName(ts time.Time, ext string) string {

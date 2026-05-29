@@ -19,9 +19,11 @@ type Client struct {
 func NewClient(socketPath string) *Client {
 	return &Client{
 		hc: &http.Client{
+			Timeout: 3 * time.Second,
 			Transport: &http.Transport{
-				DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-					return net.Dial("unix", socketPath)
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					dialer := net.Dialer{Timeout: 750 * time.Millisecond}
+					return dialer.DialContext(ctx, "unix", socketPath)
 				},
 			},
 		},
@@ -152,6 +154,14 @@ func (c *Client) Monitor(queries ...MonitorQuery) (*MonitorResponse, error) {
 func (c *Client) Paste(text string) (*PasteResponse, error) {
 	var out PasteResponse
 	if err := c.post("/paste", PasteRequest{Text: text}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) Redeem(req RedeemRequest) (*RedeemResponse, error) {
+	var out RedeemResponse
+	if err := c.post("/redeem", req, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

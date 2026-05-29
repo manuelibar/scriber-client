@@ -1,0 +1,116 @@
+package persist
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+func TestCaptureStoreRecoverInflightAudioQueuesASR(t *testing.T) {
+	store := NewCaptureStore(t.TempDir())
+	writer, err := store.NewCapture(16000)
+	if err != nil {
+		t.Fatalf("NewCapture() error = %v", err)
+	}
+	pcm := make([]byte, 320)
+	pcm[0] = 0x01
+	pcm[2] = 0x02
+	if err := writer.WriteChunk(pcm); err != nil {
+		t.Fatalf("WriteChunk() error = %v", err)
+	}
+	writer.mu.Lock()
+	if err := writer.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer.closed = true
+	writer.file = nil
+	writer.mu.Unlock()
+
+	plan, err := store.Recover(2)
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if len(plan.ASR) != 1 || plan.ASR[0].Stage != StageAudioFinalized {
+		t.Fatalf("ASR plan = %+v, want one AudioFinalized capture", plan.ASR)
+	}
+	meta := plan.ASR[0]
+	if meta.PCMBytes != int64(len(pcm)) || meta.AudioMs == 0 {
+		t.Fatalf("recovered bytes=%d audio_ms=%d, want nonzero finalized audio", meta.PCMBytes, meta.AudioMs)
+	}
+	for _, path := range []string{meta.PCMPath, meta.AudioPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected recovered artifact %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(store.Root, meta.CaptureID, CaptureInflightPCM)); !os.IsNotExist(err) {
+		t.Fatalf("inflight PCM should be renamed away, stat err=%v", err)
+	}
+}
+
+func TestCaptureStoreRecoverShortInflightAudioFails(t *testing.T) {
+	store := NewCaptureStore(t.TempDir())
+	writer, err := store.NewCapture(16000)
+	if err != nil {
+		t.Fatalf("NewCapture() error = %v", err)
+	}
+	if err := writer.WriteChunk([]byte{0x01}); err != nil {
+		t.Fatalf("WriteChunk() error = %v", err)
+	}
+	writer.mu.Lock()
+	if err := writer.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer.closed = true
+	writer.file = nil
+	writer.mu.Unlock()
+
+	plan, err := store.Recover(2)
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if len(plan.Failed) != 1 || plan.Failed[0].Stage != StageFailed || plan.Failed[0].FailedStage != StageRecording {
+		t.Fatalf("failed plan = %+v, want one failed recording", plan.Failed)
+	}
+}
+
+func TestRedemptionMovesOwnershipWithAppendOnlyRecord(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
+	records := []Record{
+		{Timestamp: base, MessageID: "a1", TargetStream: "notes", Transcript: "one", Success: true, Mode: "pty"},
+		{Timestamp: base.Add(time.Second), MessageID: "a2", TargetStream: "notes", Transcript: "two", Success: true, Mode: "pty"},
+		{Timestamp: base.Add(2 * time.Second), MessageID: "b1", TargetStream: "codex-main", Transcript: "existing", Success: true, Mode: "pty"},
+	}
+	for _, rec := range records {
+		if err := writeRecord(dir, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	selection, err := SelectRedemptionMessages(dir, "notes", 1, "\n")
+	if err != nil {
+		t.Fatalf("SelectRedemptionMessages() error = %v", err)
+	}
+	if selection.Text != "two" || len(selection.Messages) != 1 || selection.Messages[0].MessageID != "a2" {
+		t.Fatalf("selection = %+v, want message a2 text two", selection)
+	}
+	if _, err := SaveRedemption(dir, "notes", "codex-main", selection.Messages, selection.Text); err != nil {
+		t.Fatalf("SaveRedemption() error = %v", err)
+	}
+
+	notes, err := QueryOwnedHistory(dir, HistoryQuery{Stream: "notes"})
+	if err != nil {
+		t.Fatalf("QueryOwnedHistory(notes) error = %v", err)
+	}
+	if len(notes) != 1 || notes[0].MessageID != "a1" {
+		t.Fatalf("notes owned records = %+v, want only a1", notes)
+	}
+	codex, err := QueryOwnedHistory(dir, HistoryQuery{Stream: "codex-main"})
+	if err != nil {
+		t.Fatalf("QueryOwnedHistory(codex-main) error = %v", err)
+	}
+	if len(codex) != 2 || codex[0].MessageID != "a2" || codex[0].RedeemedFrom != "notes" || codex[0].RedeemedTo != "codex-main" || codex[1].MessageID != "b1" {
+		t.Fatalf("codex owned records = %+v, want redeemed a2 plus existing", codex)
+	}
+}
