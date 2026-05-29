@@ -1,6 +1,6 @@
 # scriber-client (`stt`)
 
-Go daemon + CLI for terminal-first STT. It listens on a global hotkey, captures mic audio, sends it to `scriber-server`, and routes the final transcript to the selected named stream. Streams are STT-owned PTY sessions, so no terminal multiplexer is required.
+Go daemon + CLI for terminal-first STT. It listens on a global hotkey, captures mic audio, sends it to `scriber-server`, and routes the final transcript to the selected stream. Streams are STT-owned PTY sessions with slot IDs and optional human names, so no terminal multiplexer is required.
 
 Every capture is saved as diagnostic WAV/JSON data. The default directory is `~/.local/state/stt/transcripts/`; do not point it at the repo root except for a temporary debug run.
 
