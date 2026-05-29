@@ -70,7 +70,7 @@ func TestGestureRecognizerTargetQueryChordSuppressesTalkKeyRelease(t *testing.T)
 
 	now := time.Now()
 	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
-	in <- Event{Kind: KeyDown, Code: evdev.KEY_F10, At: now.Add(time.Millisecond)}
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_SLASH, At: now.Add(time.Millisecond)}
 	got := readCommand(t, out)
 	if got.Action != ActionReportActiveStream {
 		t.Fatalf("query chord command = %s, want ReportActiveStream", got.Action)
@@ -108,7 +108,7 @@ func startTestRecognizer(t *testing.T) (chan Event, chan Command, func()) {
 		DoubleTapWindow: 40 * time.Millisecond,
 		TalkKey:         evdev.KEY_RIGHTCTRL,
 		CancelKey:       evdev.KEY_ESC,
-		QueryKey:        evdev.KEY_F10,
+		QueryKey:        evdev.KEY_SLASH,
 		CycleKey:        evdev.KEY_RIGHTMETA,
 		SlotKeys:        DefaultSlotKeys(),
 	}, in, out)

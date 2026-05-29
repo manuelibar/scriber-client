@@ -72,7 +72,7 @@ hotkey:
   talk_key: KEY_RIGHTCTRL
   cycle_key: KEY_RIGHTMETA
   cancel_key: KEY_ESC
-  query_key: KEY_F10
+  query_key: KEY_SLASH
   hold_threshold_ms: 1000
   double_tap_window_ms: 300
 
@@ -159,7 +159,7 @@ Without filters, `stt history prune` targets all transcript history in the confi
 - Press the cancel key (default `KEY_ESC`) to discard the current capture.
 - Tap the cycle key (default `KEY_RIGHTMETA`) to rotate the selected stream.
 - Press right-Ctrl + F1-F9 to select an assigned stream; new streams take the first free slot automatically, and the chord cancels any capture started by that key press.
-- Press right-Ctrl + F10 to show the selected target as a desktop notification; the chord also cancels any capture started by that key press.
+- Press right-Ctrl + / to show the selected target as a desktop notification; the chord also cancels any capture started by that key press.
 
 ## Operational checks
 

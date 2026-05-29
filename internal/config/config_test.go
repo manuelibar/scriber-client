@@ -22,8 +22,8 @@ func TestDefaultsUseSTTStateNamespace(t *testing.T) {
 	if cfg.Hotkey.CancelKey != "KEY_ESC" {
 		t.Fatalf("CancelKey = %q, want KEY_ESC", cfg.Hotkey.CancelKey)
 	}
-	if cfg.Hotkey.QueryKey != "KEY_F10" {
-		t.Fatalf("QueryKey = %q, want KEY_F10", cfg.Hotkey.QueryKey)
+	if cfg.Hotkey.QueryKey != "KEY_SLASH" {
+		t.Fatalf("QueryKey = %q, want KEY_SLASH", cfg.Hotkey.QueryKey)
 	}
 	if cfg.Hotkey.HoldThresholdMs != MinHoldThresholdMs {
 		t.Fatalf("HoldThresholdMs = %d, want %d", cfg.Hotkey.HoldThresholdMs, MinHoldThresholdMs)

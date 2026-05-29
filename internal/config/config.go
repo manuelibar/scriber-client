@@ -59,7 +59,7 @@ func Defaults() *Config {
 			TalkKey:           "KEY_RIGHTCTRL",
 			CycleKey:          "KEY_RIGHTMETA",
 			CancelKey:         "KEY_ESC",
-			QueryKey:          "KEY_F10",
+			QueryKey:          "KEY_SLASH",
 			HoldThresholdMs:   MinHoldThresholdMs,
 			DoubleTapWindowMs: 300,
 		},

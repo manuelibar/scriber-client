@@ -30,6 +30,7 @@ var KeyByName = map[string]evdev.EvCode{
 	"KEY_7":          evdev.KEY_7,
 	"KEY_8":          evdev.KEY_8,
 	"KEY_9":          evdev.KEY_9,
+	"KEY_SLASH":      evdev.KEY_SLASH,
 	"KEY_F1":         evdev.KEY_F1,
 	"KEY_F2":         evdev.KEY_F2,
 	"KEY_F3":         evdev.KEY_F3,
