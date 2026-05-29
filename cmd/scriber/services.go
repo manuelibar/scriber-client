@@ -161,6 +161,9 @@ func ensurePrivateConfig(repo string) error {
 			"STT_WHISPER_DEVICE=auto\n" +
 			"STT_WHISPER_LANGUAGE=en\n" +
 			"STT_SILENCE_RMS_THRESHOLD=0.0005\n" +
+			"STT_SERVER_HOST=127.0.0.1\n" +
+			"STT_SERVER_PORT=8765\n" +
+			"STT_GPU_COUNT=1\n" +
 			"BUILD_CACHE_MODEL=1\n"
 		if err := os.WriteFile(envPath, []byte(env), 0o600); err != nil {
 			return fmt.Errorf("write %s: %w", envPath, err)

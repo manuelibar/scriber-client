@@ -22,9 +22,6 @@ RUN go mod download
 
 COPY . .
 ENV CGO_ENABLED=1
-RUN go build -trimpath -ldflags="-s -w" -o /out/stt ./cmd/scriber
+RUN go build -trimpath -ldflags="-s -w" -o /tmp/stt ./cmd/scriber
 
-# Final stage: minimal scratch + the binary, used as a "copy-out" image.
-FROM scratch
-COPY --from=build /out/stt /stt
-ENTRYPOINT ["/bin/cp", "/stt", "/out/stt"]
+ENTRYPOINT ["/bin/cp", "/tmp/stt", "/out/stt"]

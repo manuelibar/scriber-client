@@ -26,8 +26,6 @@ make build-docker
 make install
 ```
 
-This intentionally installs `stt`, not `scriber`, to avoid clobbering any existing Hermes `scriber` wrapper.
-
 ## Run
 
 ```bash

@@ -259,20 +259,12 @@ func monitorCmd() *cobra.Command {
 	var once bool
 	var historyLimit int
 	var historyStream string
-	var legacyTranscripts string
 	c := &cobra.Command{
 		Use:   "monitor",
 		Short: "Show daemon state, streams, selected target, session history, and audio level",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if interval <= 0 {
 				return fmt.Errorf("interval must be positive")
-			}
-			if cmd.Flags().Changed("transcripts") {
-				n, err := parseMonitorHistoryLimit(legacyTranscripts)
-				if err != nil {
-					return err
-				}
-				historyLimit = n
 			}
 			if historyLimit < 0 {
 				return fmt.Errorf("history-limit must be zero or greater")
@@ -331,24 +323,7 @@ func monitorCmd() *cobra.Command {
 	c.Flags().BoolVar(&once, "once", false, "print one combined snapshot and exit")
 	c.Flags().IntVar(&historyLimit, "history-limit", 200, "session transcript ring size; 0 hides monitor-session history")
 	c.Flags().StringVar(&historyStream, "history-stream", "", "only show monitor-session history for a specific stream name")
-	c.Flags().StringVar(&legacyTranscripts, "transcripts", "", "deprecated alias for --history-limit")
-	_ = c.Flags().MarkHidden("transcripts")
 	return c
-}
-
-func parseMonitorHistoryLimit(raw string) (int, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 0, nil
-	}
-	if raw == "all" {
-		return 200, nil
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return 0, fmt.Errorf("history-limit must be zero or greater")
-	}
-	return n, nil
 }
 
 type monitorHistory struct {

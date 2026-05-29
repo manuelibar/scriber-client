@@ -163,8 +163,16 @@ func checkDocker() checkResult {
 	if err != nil {
 		return checkResult{name: "docker", ok: false, msg: "docker client not found", fix: "run ./setup-docker.sh from the repo root"}
 	}
+	if !socketAvailable("/var/run/docker.sock") {
+		return checkResult{
+			name: "docker",
+			ok:   false,
+			msg:  "rootful Docker socket missing at /var/run/docker.sock",
+			fix:  "run ./setup-docker.sh, then log out and back in if group membership changed",
+		}
+	}
 	cmd := exec.Command(docker, "info")
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(docker)+":/usr/local/bin:/usr/bin:/bin")
+	cmd.Env = dockerEnvForSTT(docker)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return checkResult{
 			name: "docker",
@@ -174,6 +182,47 @@ func checkDocker() checkResult {
 		}
 	}
 	return checkResult{name: "docker", ok: true, msg: "client and daemon reachable"}
+}
+
+func dockerEnvForSTT(docker string) []string {
+	env := replaceEnv(os.Environ(), "PATH", filepath.Dir(docker)+":/usr/local/bin:/usr/bin:/bin")
+	return removeEnv(env, "DOCKER_HOST")
+}
+
+func socketAvailable(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode()&os.ModeSocket != 0
+}
+
+func replaceEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, item := range env {
+		if strings.HasPrefix(item, prefix) {
+			if !replaced {
+				out = append(out, prefix+value)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, item)
+	}
+	if !replaced {
+		out = append(out, prefix+value)
+	}
+	return out
+}
+
+func removeEnv(env []string, key string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env))
+	for _, item := range env {
+		if !strings.HasPrefix(item, prefix) {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
 func lastNonEmptyLine(s string) string {
