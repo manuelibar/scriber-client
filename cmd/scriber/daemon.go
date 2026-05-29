@@ -126,7 +126,23 @@ func (d *daemonState) setServerOK(ok bool) {
 func runDaemon(parent context.Context, cfg *config.Config) error {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	ctx, cancel := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	lock, err := acquireDaemonLock()
+	if err != nil {
+		return err
+	}
+	defer releaseDaemonLock(lock)
+
+	if procs, err := findDaemonProcesses(); err == nil {
+		if others := otherDaemonProcesses(procs, os.Getpid()); len(others) > 0 {
+			return fmt.Errorf("another stt daemon process is already running: pid(s)=%s", formatPIDs(daemonProcessPIDs(others)))
+		}
+	} else {
+		slog.Warn("could not inspect stt daemon processes", "err", err)
+	}
+
+	signalCtx, stopSignals := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithCancel(signalCtx)
 	defer cancel()
 
 	talkCode, err := hotkey.ParseKey(cfg.Hotkey.TalkKey)
@@ -137,11 +153,16 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("cycle_key: %w", err)
 	}
+	cancelCode, err := hotkey.ParseKey(cfg.Hotkey.CancelKey)
+	if err != nil {
+		return fmt.Errorf("cancel_key: %w", err)
+	}
 
-	watched := map[evdev.EvCode]bool{talkCode: true, cycleCode: true}
+	watched := map[evdev.EvCode]bool{talkCode: true, cycleCode: true, cancelCode: true}
 	for code := range slotByKeyCode {
 		watched[code] = true
 	}
+	watched[targetKeyCode] = true
 	evChan, err := hotkey.Listen(ctx, watched)
 	if err != nil {
 		return fmt.Errorf("hotkey listen: %w", err)
@@ -161,37 +182,70 @@ func runDaemon(parent context.Context, cfg *config.Config) error {
 	}
 
 	state := &daemonState{fsmState: hotkey.StateIdle.String()}
+	var serviceWG sync.WaitGroup
+	var workWG sync.WaitGroup
+	goService := func(fn func()) {
+		serviceWG.Add(1)
+		go func() {
+			defer serviceWG.Done()
+			fn()
+		}()
+	}
 
-	ipcSrv := ipc.NewServer(config.SocketPath(), reg, state)
-	go func() {
+	requestShutdown := func() {
+		state.setState("ShuttingDown")
+		cancel()
+	}
+	ipcSrv := ipc.NewServer(config.SocketPath(), reg, state, requestShutdown, cfg.Storage.TranscriptsDir)
+	goService(func() {
 		if err := ipcSrv.Serve(ctx); err != nil {
 			slog.Error("ipc server", "err", err)
 		}
-	}()
+	})
 
-	go healthLoop(ctx, asrClient, state)
-	go levelLoop(ctx, mic, state)
-	go pruneLoop(ctx, reg, cfg.UI.Notifications)
+	goService(func() { healthLoop(ctx, asrClient, state) })
+	goService(func() { levelLoop(ctx, mic, state) })
+	goService(func() { pruneLoop(ctx, reg) })
 
 	talkEvents := make(chan hotkey.Event, 16)
-	go splitEvents(ctx, evChan, talkCode, cycleCode, talkEvents, reg, cfg.UI.Notifications)
+	goService(func() {
+		splitEvents(ctx, evChan, talkCode, cycleCode, cancelCode, talkEvents, reg, cfg.UI.Notifications)
+	})
 
 	actions := make(chan hotkey.Action, 8)
-	go hotkey.Run(ctx, hotkey.FSMConfig{
-		HoldThreshold:   time.Duration(cfg.Hotkey.HoldThresholdMs) * time.Millisecond,
-		DoubleTapWindow: time.Duration(cfg.Hotkey.DoubleTapWindowMs) * time.Millisecond,
-	}, talkEvents, actions)
+	goService(func() {
+		hotkey.Run(ctx, hotkey.FSMConfig{
+			HoldThreshold:   time.Duration(cfg.Hotkey.HoldThresholdMs) * time.Millisecond,
+			DoubleTapWindow: time.Duration(cfg.Hotkey.DoubleTapWindowMs) * time.Millisecond,
+		}, talkEvents, actions)
+	})
 
-	slog.Info("stt daemon ready", "talk", cfg.Hotkey.TalkKey, "cycle", cfg.Hotkey.CycleKey)
+	slog.Info("stt daemon ready", "talk", cfg.Hotkey.TalkKey, "cycle", cfg.Hotkey.CycleKey, "cancel", cfg.Hotkey.CancelKey)
 
 	for {
 		select {
 		case <-ctx.Done():
 			slog.Info("daemon stopping")
+			_ = mic.Discard()
+			waitGroupWithTimeout("transcription work", &workWG, 5*time.Second)
+			waitGroupWithTimeout("daemon services", &serviceWG, 2*time.Second)
 			return nil
 		case action := <-actions:
-			handleAction(ctx, action, mic, asrClient, reg, cfg, state)
+			handleAction(ctx, action, mic, asrClient, reg, cfg, state, &workWG)
 		}
+	}
+}
+
+func waitGroupWithTimeout(name string, wg *sync.WaitGroup, timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		slog.Warn("timed out waiting during shutdown", "component", name, "timeout", timeout)
 	}
 }
 
@@ -207,10 +261,16 @@ var slotByKeyCode = map[evdev.EvCode]int{
 	evdev.KEY_9: 9,
 }
 
-func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCode evdev.EvCode, talkOut chan<- hotkey.Event, reg *output.Registry, notifyOn bool) {
+const targetKeyCode = evdev.KEY_0
+
+var notifySend = notify.Send
+
+func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCode, cancelCode evdev.EvCode, talkOut chan<- hotkey.Event, reg *output.Registry, notifyOn bool) {
 	defer close(talkOut)
 	talkDown := false
+	cycleDown := false
 	suppressTalkUp := false
+	chordHandled := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -222,8 +282,12 @@ func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCod
 			switch ev.Code {
 			case talkCode:
 				if ev.Kind == hotkey.KeyDown {
+					if talkDown {
+						continue
+					}
 					talkDown = true
 					suppressTalkUp = false
+					chordHandled = false
 					select {
 					case talkOut <- ev:
 					case <-ctx.Done():
@@ -232,7 +296,11 @@ func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCod
 					continue
 				}
 				if ev.Kind == hotkey.KeyUp {
+					if !talkDown {
+						continue
+					}
 					talkDown = false
+					chordHandled = false
 					if suppressTalkUp {
 						suppressTalkUp = false
 						continue
@@ -245,11 +313,53 @@ func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCod
 				}
 			case cycleCode:
 				if ev.Kind == hotkey.KeyDown {
-					handleCycle(reg, notifyOn)
+					if cycleDown {
+						continue
+					}
+					cycleDown = true
+					handleCycle(reg)
+				}
+				if ev.Kind == hotkey.KeyUp {
+					cycleDown = false
+				}
+			case targetKeyCode:
+				if ev.Kind == hotkey.KeyDown && talkDown {
+					if chordHandled {
+						continue
+					}
+					chordHandled = true
+					select {
+					case talkOut <- hotkey.Event{Kind: hotkey.Cancel, Code: talkCode, At: ev.At}:
+					case <-ctx.Done():
+						return
+					}
+					suppressTalkUp = true
+					handleTargetNotification(reg, notifyOn)
+				}
+			case cancelCode:
+				if ev.Kind == hotkey.KeyDown {
+					if talkDown && chordHandled {
+						continue
+					}
+					if talkDown {
+						chordHandled = true
+					}
+					select {
+					case talkOut <- hotkey.Event{Kind: hotkey.Cancel, Code: cancelCode, At: ev.At}:
+					case <-ctx.Done():
+						return
+					}
+					if talkDown {
+						suppressTalkUp = true
+					}
 				}
 			default:
 				slot, ok := slotByKeyCode[ev.Code]
 				if ok && ev.Kind == hotkey.KeyDown && talkDown {
+					if chordHandled {
+						continue
+					}
+					chordHandled = true
 					select {
 					case talkOut <- hotkey.Event{Kind: hotkey.Cancel, Code: talkCode, At: ev.At}:
 					case <-ctx.Done():
@@ -263,14 +373,11 @@ func splitEvents(ctx context.Context, in <-chan hotkey.Event, talkCode, cycleCod
 	}
 }
 
-func handleAction(ctx context.Context, action hotkey.Action, mic *audio.Capture, asrClient *asr.Client, reg *output.Registry, cfg *config.Config, state *daemonState) {
+func handleAction(ctx context.Context, action hotkey.Action, mic *audio.Capture, asrClient *asr.Client, reg *output.Registry, cfg *config.Config, state *daemonState, workWG *sync.WaitGroup) {
 	switch action {
 	case hotkey.ActionStartCapture:
 		if err := mic.Start(); err != nil {
 			slog.Error("audio start", "err", err)
-			if cfg.UI.Notifications {
-				notify.Send("stt error", "audio start: "+err.Error())
-			}
 			state.stopRecording()
 			state.setState(hotkey.StateIdle.String())
 		} else {
@@ -290,7 +397,11 @@ func handleAction(ctx context.Context, action hotkey.Action, mic *audio.Capture,
 			state.setState(hotkey.StateIdle.String())
 			return
 		}
-		go transcribeAndSend(ctx, pcm, asrClient, reg, cfg, state)
+		workWG.Add(1)
+		go func() {
+			defer workWG.Done()
+			transcribeAndSend(ctx, pcm, asrClient, reg, cfg, state)
+		}()
 	case hotkey.ActionDiscardCapture:
 		_ = mic.Discard()
 		state.stopRecording()
@@ -313,9 +424,6 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 	if audioPath, err := persist.SavePCM16WAV(cfg.Storage.TranscriptsDir, now, pcm, cfg.Audio.SampleRate); err != nil {
 		slog.Error("save raw audio", "err", err)
 		rec.AudioSaveError = err.Error()
-		if cfg.UI.Notifications {
-			notify.Send("stt: raw audio save failed", err.Error())
-		}
 	} else {
 		rec.AudioPath = audioPath
 	}
@@ -328,9 +436,6 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 		rec.Success = false
 		rec.Error = err.Error()
 		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
-		if cfg.UI.Notifications {
-			notify.Send("stt: transcribe failed", err.Error())
-		}
 		return
 	}
 	rec.Transcript = result.Text
@@ -342,9 +447,6 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 		rec.Mode = "noop"
 		rec.Error = "no stream selected"
 		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
-		if cfg.UI.Notifications {
-			notify.Send("stt: no stream selected", "run `stt attach NAME` in a terminal")
-		}
 		return
 	}
 	target := stream.Target
@@ -357,9 +459,6 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 		_ = reg.PruneDead()
 		rec.Error = err.Error()
 		_ = persist.Save(cfg.Storage.TranscriptsDir, rec)
-		if cfg.UI.Notifications {
-			notify.Send("stt: send failed", err.Error())
-		}
 		return
 	}
 
@@ -369,17 +468,11 @@ func transcribeAndSend(ctx context.Context, pcm []byte, asrClient *asr.Client, r
 	slog.Info("dictated", "stream", stream.Name, "target", target.TargetRef, "chars", len(result.Text), "audio_ms", audioMs, "infer_ms", result.Ms)
 }
 
-func handleCycle(reg *output.Registry, notifyOn bool) {
+func handleCycle(reg *output.Registry) {
 	active, err := reg.Cycle()
 	if err != nil {
-		if notifyOn {
-			notify.Send("stt: cycle failed", err.Error())
-		}
 		slog.Warn("cycle", "err", err)
 		return
-	}
-	if notifyOn {
-		notify.Send("stt → "+active, "")
 	}
 	slog.Info("cycled", "active", active)
 }
@@ -388,15 +481,52 @@ func handleSelectSlot(reg *output.Registry, slot int, notifyOn bool) {
 	active, err := reg.SelectSlot(slot)
 	if err != nil {
 		if notifyOn {
-			notify.Send(fmt.Sprintf("stt: slot %d failed", slot), err.Error())
+			notifySend(fmt.Sprintf("stt: slot %d failed", slot), err.Error())
 		}
 		slog.Warn("select slot", "slot", slot, "err", err)
 		return
 	}
 	if notifyOn {
-		notify.Send(fmt.Sprintf("stt slot %d → %s", slot, active), "")
+		notifySend(fmt.Sprintf("stt slot %d → %s", slot, active), "")
 	}
 	slog.Info("selected slot", "slot", slot, "active", active)
+}
+
+func handleTargetNotification(reg *output.Registry, notifyOn bool) {
+	title, body := currentTargetNotification(reg)
+	if notifyOn {
+		notifySend(title, body)
+	}
+	slog.Info("reported target", "body", body)
+}
+
+func currentTargetNotification(reg *output.Registry) (string, string) {
+	streams, active, activeSlot := reg.Streams()
+	return formatTargetNotification(streams, active, activeSlot)
+}
+
+func formatTargetNotification(streams []ipc.Stream, active string, activeSlot int) (string, string) {
+	slot := "-"
+	name := "(none)"
+	if active != "" || activeSlot > 0 {
+		name = active
+		if name == "" {
+			name = "-"
+		}
+		for _, stream := range streams {
+			if activeSlot > 0 && stream.Slot != activeSlot {
+				continue
+			}
+			if activeSlot == 0 && stream.Name != active {
+				continue
+			}
+			if stream.Slot > 0 {
+				slot = fmt.Sprintf("%d", stream.Slot)
+			}
+			break
+		}
+	}
+	return "stt target", fmt.Sprintf("slot=%s name=%s", slot, name)
 }
 
 func healthLoop(ctx context.Context, asrClient *asr.Client, state *daemonState) {
@@ -435,7 +565,7 @@ func levelLoop(ctx context.Context, mic *audio.Capture, state *daemonState) {
 	}
 }
 
-func pruneLoop(ctx context.Context, reg *output.Registry, notifyOn bool) {
+func pruneLoop(ctx context.Context, reg *output.Registry) {
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
 	for {
@@ -445,9 +575,6 @@ func pruneLoop(ctx context.Context, reg *output.Registry, notifyOn bool) {
 		case <-tick.C:
 			for _, streamName := range reg.PruneDead() {
 				slog.Info("marked dead stream target", "stream", streamName)
-				if notifyOn {
-					notify.Send("stt: stream target gone", streamName+" marked dead")
-				}
 			}
 		}
 	}

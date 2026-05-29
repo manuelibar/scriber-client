@@ -14,6 +14,7 @@ type Hotkey struct {
 	Device            string `yaml:"device"`
 	TalkKey           string `yaml:"talk_key"`
 	CycleKey          string `yaml:"cycle_key"`
+	CancelKey         string `yaml:"cancel_key"`
 	HoldThresholdMs   int    `yaml:"hold_threshold_ms"`
 	DoubleTapWindowMs int    `yaml:"double_tap_window_ms"`
 }
@@ -46,6 +47,8 @@ type Config struct {
 	UI      UI      `yaml:"ui"`
 }
 
+const MinHoldThresholdMs = 1000
+
 func Defaults() *Config {
 	home, _ := os.UserHomeDir()
 	state := filepath.Join(home, ".local", "state", "stt")
@@ -54,7 +57,8 @@ func Defaults() *Config {
 			Device:            "auto",
 			TalkKey:           "KEY_RIGHTCTRL",
 			CycleKey:          "KEY_RIGHTMETA",
-			HoldThresholdMs:   180,
+			CancelKey:         "KEY_ESC",
+			HoldThresholdMs:   MinHoldThresholdMs,
 			DoubleTapWindowMs: 350,
 		},
 		Audio: Audio{
@@ -98,9 +102,16 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
+	cfg.Normalize()
 	cfg.Storage.TranscriptsDir = ExpandPath(cfg.Storage.TranscriptsDir)
 	cfg.Storage.RegistryPath = ExpandPath(cfg.Storage.RegistryPath)
 	return cfg, nil
+}
+
+func (c *Config) Normalize() {
+	if c.Hotkey.HoldThresholdMs < MinHoldThresholdMs {
+		c.Hotkey.HoldThresholdMs = MinHoldThresholdMs
+	}
 }
 
 func ExpandPath(path string) string {

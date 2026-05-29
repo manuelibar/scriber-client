@@ -15,14 +15,16 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.AddCommand(
+		startCmd(),
+		shutdownCmd(),
 		daemonCmd(),
 		attachCmd(),
 		detachCmd(),
 		streamCmd(),
-		streamsCmd(),
 		selectCmd(),
 		cycleCmd(),
-		statusCmd(),
+		pasteCmd(),
+		historyCmd(),
 		monitorCmd(),
 		doctorCmd(),
 	)

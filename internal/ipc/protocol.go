@@ -30,7 +30,7 @@ type Target struct {
 // Stream is the user-facing destination for dictated final text.
 type Stream struct {
 	ID         string    `json:"id"`
-	Name       string    `json:"name"`
+	Name       string    `json:"name,omitempty"`
 	Slot       int       `json:"slot,omitempty"`
 	Target     Target    `json:"target"`
 	Status     string    `json:"status"`
@@ -44,7 +44,7 @@ type AttachRequest struct {
 	TTY        string `json:"tty"`
 	CWD        string `json:"cwd"`
 	Term       string `json:"term"`
-	StreamName string `json:"stream_name"`
+	StreamName string `json:"stream_name,omitempty"`
 	TargetType string `json:"target_type"`
 	TargetRef  string `json:"target_ref"`
 	Label      string `json:"label,omitempty"`
@@ -57,12 +57,8 @@ type AttachResponse struct {
 
 type DetachRequest struct {
 	Name      string `json:"name,omitempty"`
+	Slot      int    `json:"slot,omitempty"`
 	TargetRef string `json:"target_ref,omitempty"`
-}
-
-type ListResponse struct {
-	Active  string   `json:"active"`
-	Streams []Stream `json:"streams"`
 }
 
 type SelectRequest struct {
@@ -94,16 +90,46 @@ type CycleResponse struct {
 	Active string `json:"active"`
 }
 
-type StatusResponse struct {
-	State            string    `json:"state"`
-	Active           string    `json:"active"`
-	ActiveSlot       int       `json:"active_slot,omitempty"`
-	RecordingMs      int       `json:"recording_ms,omitempty"`
-	AudioLevel       float64   `json:"audio_level,omitempty"`
-	StreamCount      int       `json:"stream_count"`
-	LastTranscript   string    `json:"last_transcript,omitempty"`
-	LastTranscriptAt time.Time `json:"last_transcript_at,omitempty"`
-	ServerOK         bool      `json:"server_ok"`
+type TranscriptEntry struct {
+	Timestamp   time.Time `json:"ts"`
+	AudioMs     int       `json:"audio_ms,omitempty"`
+	Stream      string    `json:"stream,omitempty"`
+	TargetType  string    `json:"target_type,omitempty"`
+	TargetRef   string    `json:"target_ref,omitempty"`
+	Mode        string    `json:"mode,omitempty"`
+	Success     bool      `json:"success"`
+	Error       string    `json:"error,omitempty"`
+	InferenceMs int       `json:"inference_ms,omitempty"`
+	Transcript  string    `json:"transcript"`
+}
+
+type MonitorResponse struct {
+	State                   string            `json:"state"`
+	PID                     int               `json:"pid,omitempty"`
+	Active                  string            `json:"active"`
+	ActiveSlot              int               `json:"active_slot,omitempty"`
+	RecordingMs             int               `json:"recording_ms,omitempty"`
+	AudioLevel              float64           `json:"audio_level,omitempty"`
+	Streams                 []Stream          `json:"streams"`
+	Transcripts             []TranscriptEntry `json:"transcripts,omitempty"`
+	TranscriptHistoryLoaded bool              `json:"transcript_history_loaded,omitempty"`
+	TranscriptHistoryError  string            `json:"transcript_history_error,omitempty"`
+	LastTranscript          string            `json:"last_transcript,omitempty"`
+	LastTranscriptAt        time.Time         `json:"last_transcript_at,omitempty"`
+	ServerOK                bool              `json:"server_ok"`
+}
+
+type ShutdownResponse struct {
+	OK bool `json:"ok"`
+}
+
+type PasteRequest struct {
+	Text string `json:"text"`
+}
+
+type PasteResponse struct {
+	Stream string `json:"stream"`
+	Chars  int    `json:"chars"`
 }
 
 type InjectRequest struct {

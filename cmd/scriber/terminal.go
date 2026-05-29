@@ -23,9 +23,6 @@ import (
 )
 
 func runAttachedTerminal(ctx context.Context, streamName string, command []string) error {
-	if streamName == "" {
-		return fmt.Errorf("stream name is required")
-	}
 	if !isTerminal(int(os.Stdin.Fd())) || !isTerminal(int(os.Stdout.Fd())) {
 		return fmt.Errorf("stt attach must run from an interactive terminal")
 	}
@@ -33,7 +30,7 @@ func runAttachedTerminal(ctx context.Context, streamName string, command []strin
 		command = defaultShellCommand()
 	}
 	daemonClient := ipc.NewClient(config.SocketPath())
-	if _, err := daemonClient.Status(); err != nil {
+	if _, err := daemonClient.Monitor(); err != nil {
 		return err
 	}
 
@@ -46,7 +43,10 @@ func runAttachedTerminal(ctx context.Context, streamName string, command []strin
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
 	cwd, _ := os.Getwd()
 	cmd.Dir = cwd
-	cmd.Env = append(os.Environ(), "STT_STREAM="+streamName)
+	cmd.Env = os.Environ()
+	if streamName != "" {
+		cmd.Env = append(cmd.Env, "STT_STREAM="+streamName)
+	}
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {

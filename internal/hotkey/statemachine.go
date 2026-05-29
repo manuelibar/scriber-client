@@ -70,14 +70,14 @@ func decide(state State, in Input) Decision {
 	switch state {
 	case StateIdle:
 		if in == InKeyDown {
-			return Decision{NewState: StatePress1Down, Action: ActionStartCapture, SetHoldTimer: true}
+			return Decision{NewState: StatePress1Down, SetHoldTimer: true}
 		}
 	case StatePress1Down:
 		if in == InKeyUp {
 			return Decision{NewState: StateLockArmed, ClearTimers: true, SetLockTimer: true}
 		}
 		if in == InHoldTimer {
-			return Decision{NewState: StateHolding}
+			return Decision{NewState: StateHolding, Action: ActionStartCapture}
 		}
 	case StateHolding:
 		if in == InKeyUp {
@@ -85,17 +85,17 @@ func decide(state State, in Input) Decision {
 		}
 	case StateLockArmed:
 		if in == InLockTimer {
-			return Decision{NewState: StateIdle, Action: ActionDiscardCapture}
+			return Decision{NewState: StateIdle}
 		}
 		if in == InKeyDown {
 			return Decision{NewState: StatePress2Down, ClearTimers: true, SetHoldTimer: true}
 		}
 	case StatePress2Down:
 		if in == InKeyUp {
-			return Decision{NewState: StateLocked, ClearTimers: true}
+			return Decision{NewState: StateIdle, ClearTimers: true}
 		}
 		if in == InHoldTimer {
-			return Decision{NewState: StateHolding}
+			return Decision{NewState: StateLocked, Action: ActionStartCapture}
 		}
 	case StateLocked:
 		if in == InKeyDown {

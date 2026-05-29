@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
+	"time"
 )
 
 type Client struct {
@@ -75,14 +78,6 @@ func (c *Client) Detach(req *DetachRequest) error {
 	return c.post("/detach", req, nil)
 }
 
-func (c *Client) Streams() (*ListResponse, error) {
-	var out ListResponse
-	if err := c.get("/streams", &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-
 func (c *Client) Select(name string) (*SelectResponse, error) {
 	var out SelectResponse
 	if err := c.post("/select", SelectRequest{Name: name}, &out); err != nil {
@@ -123,10 +118,46 @@ func (c *Client) Cycle() (*CycleResponse, error) {
 	return &out, nil
 }
 
-func (c *Client) Status() (*StatusResponse, error) {
-	var out StatusResponse
-	if err := c.get("/status", &out); err != nil {
+type MonitorQuery struct {
+	HistorySince  time.Time
+	HistoryStream string
+	HistoryLimit  int
+}
+
+func (c *Client) Monitor(queries ...MonitorQuery) (*MonitorResponse, error) {
+	var out MonitorResponse
+	path := "/monitor"
+	if len(queries) > 0 {
+		values := url.Values{}
+		query := queries[0]
+		if !query.HistorySince.IsZero() {
+			values.Set("history_since", query.HistorySince.UTC().Format(time.RFC3339Nano))
+		}
+		if query.HistoryStream != "" {
+			values.Set("history_stream", query.HistoryStream)
+		}
+		if query.HistoryLimit != 0 {
+			values.Set("history_limit", strconv.Itoa(query.HistoryLimit))
+		}
+		if encoded := values.Encode(); encoded != "" {
+			path += "?" + encoded
+		}
+	}
+	if err := c.get(path, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+func (c *Client) Paste(text string) (*PasteResponse, error) {
+	var out PasteResponse
+	if err := c.post("/paste", PasteRequest{Text: text}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) Shutdown() error {
+	var out ShutdownResponse
+	return c.post("/shutdown", nil, &out)
 }

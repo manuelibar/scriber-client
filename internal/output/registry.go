@@ -38,6 +38,7 @@ type Registry struct {
 
 type registryFile struct {
 	ActiveStream string       `json:"active_stream,omitempty"`
+	ActiveSlot   int          `json:"active_slot,omitempty"`
 	Streams      []ipc.Stream `json:"streams,omitempty"`
 }
 
@@ -78,15 +79,14 @@ func (r *Registry) normalizeLocked() {
 	for i := range r.state.Streams {
 		s := &r.state.Streams[i]
 		s.Name = strings.TrimSpace(s.Name)
-		if s.Name == "" {
-			s.Name = fmt.Sprintf("stream-%d", i+1)
-		}
-		if seenNames[s.Name] {
+		if s.Name != "" && seenNames[s.Name] {
 			s.Name = uniqueName(s.Name, seenNames)
 		}
-		seenNames[s.Name] = true
+		if s.Name != "" {
+			seenNames[s.Name] = true
+		}
 		if s.ID == "" {
-			s.ID = streamIDFor(s.Name)
+			s.ID = streamIDForStream(*s)
 		}
 		if s.Status == "" {
 			s.Status = ipc.StreamStatusActive
@@ -101,12 +101,12 @@ func (r *Registry) normalizeLocked() {
 			s.Target.TargetType = ipc.TargetTypePTY
 		}
 		if s.Target.ID == "" && s.Target.TargetRef != "" {
-			s.Target.ID = targetIDFor(s.Name, s.Target.TargetRef)
+			s.Target.ID = targetIDForStream(*s, s.Target.TargetRef)
 		}
 		if s.Target.StreamID == "" {
 			s.Target.StreamID = s.ID
 		}
-		if s.Target.Label == "" {
+		if s.Target.Label == "" && s.Name != "" {
 			s.Target.Label = s.Name
 		}
 		if s.Target.AttachedAt.IsZero() {
@@ -124,6 +124,9 @@ func (r *Registry) normalizeLocked() {
 	}
 	if r.state.ActiveStream != "" && r.findStreamLocked(r.state.ActiveStream) < 0 {
 		r.state.ActiveStream = ""
+	}
+	if r.state.ActiveSlot < 0 || r.state.ActiveSlot > 9 {
+		r.state.ActiveSlot = 0
 	}
 }
 
@@ -144,9 +147,6 @@ func (r *Registry) saveLocked() error {
 
 func (r *Registry) Attach(req *ipc.AttachRequest) (*ipc.Stream, string, error) {
 	name := strings.TrimSpace(req.StreamName)
-	if name == "" {
-		name = defaultNameFor(req)
-	}
 	if req.TargetType == "" {
 		req.TargetType = ipc.TargetTypePTY
 	}
@@ -161,11 +161,13 @@ func (r *Registry) Attach(req *ipc.AttachRequest) (*ipc.Stream, string, error) {
 	defer r.mu.Unlock()
 
 	now := time.Now().UTC()
-	idx := r.findStreamLocked(name)
+	idx := -1
+	if name != "" {
+		idx = r.findStreamLocked(name)
+	}
 	message := ""
 	if idx < 0 {
 		r.state.Streams = append(r.state.Streams, ipc.Stream{
-			ID:         streamIDFor(name),
 			Name:       name,
 			AttachedAt: now,
 		})
@@ -175,17 +177,20 @@ func (r *Registry) Attach(req *ipc.AttachRequest) (*ipc.Stream, string, error) {
 	}
 
 	stream := &r.state.Streams[idx]
-	if stream.ID == "" {
-		stream.ID = streamIDFor(name)
-	}
 	if stream.AttachedAt.IsZero() {
 		stream.AttachedAt = now
 	}
 	stream.Name = name
 	stream.Status = ipc.StreamStatusActive
 	stream.LastUsedAt = now
+	if stream.Slot == 0 {
+		stream.Slot = r.firstAvailableSlotLocked(idx)
+	}
+	if stream.ID == "" {
+		stream.ID = streamIDForStream(*stream)
+	}
 	stream.Target = ipc.Target{
-		ID:         targetIDFor(name, req.TargetRef),
+		ID:         targetIDForStream(*stream, req.TargetRef),
 		StreamID:   stream.ID,
 		TargetType: ipc.TargetTypePTY,
 		TargetRef:  req.TargetRef,
@@ -196,30 +201,14 @@ func (r *Registry) Attach(req *ipc.AttachRequest) (*ipc.Stream, string, error) {
 		AttachedAt: now,
 		LastSeenAt: now,
 	}
-	r.state.ActiveStream = name
+	r.setActiveLocked(*stream)
 
 	if err := r.saveLocked(); err != nil {
 		return nil, "", err
 	}
-	slog.Info("attached stream", "stream", name, "target", req.TargetRef, "pid", req.PID)
+	slog.Info("attached stream", "stream", streamLabel(*stream), "target", req.TargetRef, "pid", req.PID)
 	cp := *stream
 	return &cp, message, nil
-}
-
-func defaultNameFor(req *ipc.AttachRequest) string {
-	if req.Label != "" {
-		return req.Label
-	}
-	if req.TTY != "" {
-		base := filepath.Base(req.TTY)
-		if base != "" && base != "." && base != "/" {
-			return "term-" + base
-		}
-	}
-	if req.PID > 0 {
-		return fmt.Sprintf("term-%d", req.PID)
-	}
-	return "term"
 }
 
 func labelFor(req *ipc.AttachRequest, fallback string) string {
@@ -241,30 +230,21 @@ func uniqueName(desired string, taken map[string]bool) string {
 	}
 }
 
-func (r *Registry) Detach(name, targetRef string) error {
+func (r *Registry) Detach(name, targetRef string, slot int) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	target := strings.TrimSpace(name)
-	if target == "" {
-		for _, s := range r.state.Streams {
-			if s.Target.TargetRef == targetRef {
-				target = s.Name
-				break
-			}
+	idx := r.findDetachTargetLocked(strings.TrimSpace(name), targetRef, slot)
+	if idx < 0 {
+		if slot > 0 {
+			return fmt.Errorf("no stream assigned to slot %d", slot)
 		}
-	}
-	if target == "" {
 		return fmt.Errorf("no matching stream to detach (name=%q target_ref=%q)", name, targetRef)
 	}
-
-	idx := r.findStreamLocked(target)
-	if idx < 0 {
-		return fmt.Errorf("stream %q not registered", target)
-	}
+	target := r.state.Streams[idx]
 	r.state.Streams = append(r.state.Streams[:idx], r.state.Streams[idx+1:]...)
-	if r.state.ActiveStream == target {
-		r.state.ActiveStream = r.firstLiveStreamNameLocked()
+	if r.isActiveLocked(target) {
+		r.setActiveToFirstLiveLocked()
 	}
 	return r.saveLocked()
 }
@@ -277,12 +257,17 @@ func (r *Registry) DetachAll() error {
 	return r.saveLocked()
 }
 
-func (r *Registry) Streams() ([]ipc.Stream, string) {
+func (r *Registry) Streams() ([]ipc.Stream, string, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	out := make([]ipc.Stream, len(r.state.Streams))
 	copy(out, r.state.Streams)
-	return out, r.state.ActiveStream
+	idx := r.activeIndexLocked()
+	if idx < 0 {
+		return out, "", 0
+	}
+	active := r.state.Streams[idx]
+	return out, streamLabel(active), active.Slot
 }
 
 func (r *Registry) Select(name string) (string, error) {
@@ -295,9 +280,9 @@ func (r *Registry) Select(name string) (string, error) {
 	if !streamIsLive(r.state.Streams[idx]) {
 		return "", fmt.Errorf("stream %q has no live target", name)
 	}
-	r.state.ActiveStream = r.state.Streams[idx].Name
+	r.setActiveLocked(r.state.Streams[idx])
 	r.state.Streams[idx].LastUsedAt = time.Now().UTC()
-	return r.state.ActiveStream, r.saveLocked()
+	return streamLabel(r.state.Streams[idx]), r.saveLocked()
 }
 
 func (r *Registry) SetSlot(name string, slot int) (*ipc.Stream, error) {
@@ -320,6 +305,9 @@ func (r *Registry) SetSlot(name string, slot int) (*ipc.Stream, error) {
 	}
 	r.state.Streams[idx].Slot = slot
 	r.state.Streams[idx].LastUsedAt = time.Now().UTC()
+	if r.isActiveLocked(r.state.Streams[idx]) {
+		r.setActiveLocked(r.state.Streams[idx])
+	}
 	if err := r.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -335,7 +323,11 @@ func (r *Registry) ClearSlot(name string) (*ipc.Stream, error) {
 	if idx < 0 {
 		return nil, fmt.Errorf("stream %q not registered", name)
 	}
+	wasActive := r.isActiveLocked(r.state.Streams[idx])
 	r.state.Streams[idx].Slot = 0
+	if wasActive {
+		r.state.ActiveSlot = 0
+	}
 	if err := r.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -356,11 +348,11 @@ func (r *Registry) SelectSlot(slot int) (string, error) {
 			continue
 		}
 		if !streamIsLive(s) {
-			return "", fmt.Errorf("stream %q in slot %d has no live target", s.Name, slot)
+			return "", fmt.Errorf("%s in slot %d has no live target", streamLabel(s), slot)
 		}
-		r.state.ActiveStream = s.Name
+		r.setActiveLocked(s)
 		r.state.Streams[i].LastUsedAt = time.Now().UTC()
-		return r.state.ActiveStream, r.saveLocked()
+		return streamLabel(r.state.Streams[i]), r.saveLocked()
 	}
 	return "", fmt.Errorf("no stream assigned to slot %d", slot)
 }
@@ -379,27 +371,52 @@ func (r *Registry) Cycle() (string, error) {
 	}
 	currentLiveIdx := -1
 	for i, streamIdx := range live {
-		if r.state.Streams[streamIdx].Name == r.state.ActiveStream {
+		if r.isActiveLocked(r.state.Streams[streamIdx]) {
 			currentLiveIdx = i
 			break
 		}
 	}
 	next := live[(currentLiveIdx+1)%len(live)]
-	r.state.ActiveStream = r.state.Streams[next].Name
+	r.setActiveLocked(r.state.Streams[next])
 	r.state.Streams[next].LastUsedAt = time.Now().UTC()
-	return r.state.ActiveStream, r.saveLocked()
+	return streamLabel(r.state.Streams[next]), r.saveLocked()
 }
 
 // ActiveStream returns the currently selected live stream, or nil if none.
 func (r *Registry) ActiveStream() *ipc.Stream {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	idx := r.findStreamLocked(r.state.ActiveStream)
+	idx := r.activeIndexLocked()
 	if idx < 0 || !streamIsLive(r.state.Streams[idx]) {
 		return nil
 	}
 	cp := r.state.Streams[idx]
 	return &cp
+}
+
+func (r *Registry) SendTextToActive(text string) (string, error) {
+	if text == "" {
+		return "", fmt.Errorf("text is empty")
+	}
+	stream := r.ActiveStream()
+	if stream == nil {
+		return "", fmt.Errorf("no stream selected")
+	}
+	if err := SendText(stream.Target, text); err != nil {
+		_ = r.PruneDead()
+		return streamLabel(*stream), err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	idx := r.findStreamByIDLocked(stream.ID)
+	if idx >= 0 {
+		r.state.Streams[idx].LastUsedAt = time.Now().UTC()
+		if err := r.saveLocked(); err != nil {
+			return streamLabel(*stream), err
+		}
+	}
+	return streamLabel(*stream), nil
 }
 
 // PruneDead marks streams whose target process/socket no longer exists as dead.
@@ -423,14 +440,32 @@ func (r *Registry) PruneDead() []string {
 	if len(dead) == 0 {
 		return nil
 	}
-	if r.state.ActiveStream != "" {
-		idx := r.findStreamLocked(r.state.ActiveStream)
-		if idx < 0 || !streamIsLive(r.state.Streams[idx]) {
-			r.state.ActiveStream = r.firstLiveStreamNameLocked()
-		}
+	if r.activeIndexLocked() < 0 {
+		r.setActiveToFirstLiveLocked()
 	}
 	_ = r.saveLocked()
 	return dead
+}
+
+func (r *Registry) findDetachTargetLocked(name, targetRef string, slot int) int {
+	if targetRef != "" {
+		for i, s := range r.state.Streams {
+			if s.Target.TargetRef == targetRef {
+				return i
+			}
+		}
+	}
+	if slot > 0 {
+		for i, s := range r.state.Streams {
+			if s.Slot == slot {
+				return i
+			}
+		}
+	}
+	if name != "" {
+		return r.findStreamLocked(name)
+	}
+	return -1
 }
 
 func (r *Registry) findStreamLocked(name string) int {
@@ -442,27 +477,114 @@ func (r *Registry) findStreamLocked(name string) int {
 	return -1
 }
 
-func (r *Registry) firstLiveStreamNameLocked() string {
-	for _, s := range r.state.Streams {
-		if streamIsLive(s) {
-			return s.Name
+func (r *Registry) findStreamByIDLocked(id string) int {
+	if id == "" {
+		return -1
+	}
+	for i, s := range r.state.Streams {
+		if s.ID == id {
+			return i
 		}
 	}
-	return ""
+	return -1
+}
+
+func (r *Registry) activeIndexLocked() int {
+	if r.state.ActiveSlot > 0 {
+		for i, s := range r.state.Streams {
+			if s.Slot == r.state.ActiveSlot && streamIsLive(s) {
+				return i
+			}
+		}
+	}
+	if r.state.ActiveStream != "" {
+		idx := r.findStreamLocked(r.state.ActiveStream)
+		if idx >= 0 && streamIsLive(r.state.Streams[idx]) {
+			return idx
+		}
+	}
+	return -1
+}
+
+func (r *Registry) isActiveLocked(s ipc.Stream) bool {
+	if r.state.ActiveSlot > 0 && s.Slot == r.state.ActiveSlot {
+		return true
+	}
+	return r.state.ActiveStream != "" && s.Name == r.state.ActiveStream
+}
+
+func (r *Registry) setActiveLocked(s ipc.Stream) {
+	r.state.ActiveSlot = s.Slot
+	r.state.ActiveStream = strings.TrimSpace(s.Name)
+}
+
+func (r *Registry) setActiveToFirstLiveLocked() {
+	r.state.ActiveStream = ""
+	r.state.ActiveSlot = 0
+	for _, s := range r.state.Streams {
+		if streamIsLive(s) {
+			r.setActiveLocked(s)
+			return
+		}
+	}
+}
+
+func (r *Registry) firstAvailableSlotLocked(except int) int {
+	used := map[int]bool{}
+	for i, s := range r.state.Streams {
+		if i == except {
+			continue
+		}
+		if s.Slot >= 1 && s.Slot <= 9 {
+			used[s.Slot] = true
+		}
+	}
+	return firstAvailableSlot(used)
+}
+
+func firstAvailableSlot(used map[int]bool) int {
+	for slot := 1; slot <= 9; slot++ {
+		if !used[slot] {
+			return slot
+		}
+	}
+	return 0
 }
 
 func streamIsLive(s ipc.Stream) bool {
 	return s.Status == ipc.StreamStatusActive && s.Target.TargetType == ipc.TargetTypePTY && s.Target.TargetRef != ""
 }
 
-var nonSlug = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
-
-func streamIDFor(name string) string {
-	return "stream_" + stableSlug(name)
+func streamLabel(s ipc.Stream) string {
+	if strings.TrimSpace(s.Name) != "" {
+		return strings.TrimSpace(s.Name)
+	}
+	if s.Slot > 0 {
+		return fmt.Sprintf("slot %d", s.Slot)
+	}
+	if s.ID != "" {
+		return s.ID
+	}
+	return "(unnamed)"
 }
 
-func targetIDFor(name, targetRef string) string {
-	return "target_" + stableSlug(name+"_"+targetRef)
+var nonSlug = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
+
+func streamIDForStream(s ipc.Stream) string {
+	if s.Slot > 0 {
+		return fmt.Sprintf("stream_slot_%d", s.Slot)
+	}
+	if strings.TrimSpace(s.Name) != "" {
+		return "stream_" + stableSlug(s.Name)
+	}
+	if s.Target.TargetRef != "" {
+		return "stream_" + stableSlug(s.Target.TargetRef)
+	}
+	return "stream_unnamed"
+}
+
+func targetIDForStream(s ipc.Stream, targetRef string) string {
+	return "target_" + stableSlug(streamIDForStream(s)+"_"+targetRef)
 }
 
 func stableSlug(s string) string {

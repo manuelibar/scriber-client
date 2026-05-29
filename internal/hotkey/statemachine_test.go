@@ -12,12 +12,12 @@ func TestDecide_Transitions(t *testing.T) {
 		want  Decision
 	}{
 		// Push-to-talk happy path
-		{"idle + keydown -> press1+capture+hold-timer",
+		{"idle + keydown -> press1+hold-timer",
 			StateIdle, InKeyDown,
-			Decision{NewState: StatePress1Down, Action: ActionStartCapture, SetHoldTimer: true}},
-		{"press1 + hold-timer -> holding",
+			Decision{NewState: StatePress1Down, SetHoldTimer: true}},
+		{"press1 + hold-timer -> holding+capture",
 			StatePress1Down, InHoldTimer,
-			Decision{NewState: StateHolding}},
+			Decision{NewState: StateHolding, Action: ActionStartCapture}},
 		{"holding + keyup -> idle+stop+send",
 			StateHolding, InKeyUp,
 			Decision{NewState: StateIdle, Action: ActionStopAndSend, ClearTimers: true}},
@@ -26,28 +26,26 @@ func TestDecide_Transitions(t *testing.T) {
 		{"press1 + keyup -> lockarmed+lock-timer",
 			StatePress1Down, InKeyUp,
 			Decision{NewState: StateLockArmed, ClearTimers: true, SetLockTimer: true}},
-		{"lockarmed + lock-timer -> idle+discard",
+		{"lockarmed + lock-timer -> idle",
 			StateLockArmed, InLockTimer,
-			Decision{NewState: StateIdle, Action: ActionDiscardCapture}},
+			Decision{NewState: StateIdle}},
 
-		// Double-tap to lock
+		// Double-tap without holding must not start capture.
 		{"lockarmed + keydown -> press2+hold-timer",
 			StateLockArmed, InKeyDown,
 			Decision{NewState: StatePress2Down, ClearTimers: true, SetHoldTimer: true}},
-		{"press2 + keyup -> locked",
+		{"press2 + keyup -> idle",
 			StatePress2Down, InKeyUp,
-			Decision{NewState: StateLocked, ClearTimers: true}},
+			Decision{NewState: StateIdle, ClearTimers: true}},
+		{"press2 + hold-timer -> locked+capture",
+			StatePress2Down, InHoldTimer,
+			Decision{NewState: StateLocked, Action: ActionStartCapture}},
 		{"locked + keydown -> ending+stop+send",
 			StateLocked, InKeyDown,
 			Decision{NewState: StateLockedEnding, Action: ActionStopAndSend}},
 		{"ending + keyup -> idle",
 			StateLockedEnding, InKeyUp,
 			Decision{NewState: StateIdle}},
-
-		// Tap-then-hold: second press is held, abandon lock-arm and treat as PTT
-		{"press2 + hold-timer -> holding",
-			StatePress2Down, InHoldTimer,
-			Decision{NewState: StateHolding}},
 
 		// Ignored inputs (no-op): random subset
 		{"idle + keyup ignored",
@@ -99,38 +97,37 @@ func TestDecide_Sequences(t *testing.T) {
 		{
 			name: "push-to-talk: keydown, hold, keyup",
 			steps: []step{
-				{InKeyDown, ActionStartCapture, StatePress1Down},
-				{InHoldTimer, ActionNone, StateHolding},
+				{InKeyDown, ActionNone, StatePress1Down},
+				{InHoldTimer, ActionStartCapture, StateHolding},
 				{InKeyUp, ActionStopAndSend, StateIdle},
 			},
 		},
 		{
 			name: "single tap that times out",
 			steps: []step{
-				{InKeyDown, ActionStartCapture, StatePress1Down},
+				{InKeyDown, ActionNone, StatePress1Down},
 				{InKeyUp, ActionNone, StateLockArmed},
-				{InLockTimer, ActionDiscardCapture, StateIdle},
+				{InLockTimer, ActionNone, StateIdle},
 			},
 		},
 		{
-			name: "double-tap lock then end",
+			name: "quick double-tap does not start capture",
 			steps: []step{
-				{InKeyDown, ActionStartCapture, StatePress1Down},
+				{InKeyDown, ActionNone, StatePress1Down},
 				{InKeyUp, ActionNone, StateLockArmed},
 				{InKeyDown, ActionNone, StatePress2Down},
-				{InKeyUp, ActionNone, StateLocked},
-				{InKeyDown, ActionStopAndSend, StateLockedEnding},
 				{InKeyUp, ActionNone, StateIdle},
 			},
 		},
 		{
-			name: "tap then hold (abandon lock-arm)",
+			name: "tap then hold locks after hold threshold",
 			steps: []step{
-				{InKeyDown, ActionStartCapture, StatePress1Down},
+				{InKeyDown, ActionNone, StatePress1Down},
 				{InKeyUp, ActionNone, StateLockArmed},
 				{InKeyDown, ActionNone, StatePress2Down},
-				{InHoldTimer, ActionNone, StateHolding},
-				{InKeyUp, ActionStopAndSend, StateIdle},
+				{InHoldTimer, ActionStartCapture, StateLocked},
+				{InKeyDown, ActionStopAndSend, StateLockedEnding},
+				{InKeyUp, ActionNone, StateIdle},
 			},
 		},
 	}

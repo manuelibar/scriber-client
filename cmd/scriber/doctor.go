@@ -118,7 +118,7 @@ func checkMic(cfg *config.Config) checkResult {
 			name: "microphone",
 			ok:   false,
 			msg:  err.Error(),
-			fix:  "ensure pipewire-pulse is running (systemctl --user status pipewire-pulse)",
+			fix:  "ensure PipeWire/PulseAudio is running and the default input device is available",
 		}
 	}
 	defer mic.Close()
@@ -196,31 +196,83 @@ func checkServer(cfg *config.Config) checkResult {
 			name: "stt-server",
 			ok:   false,
 			msg:  err.Error(),
-			fix:  "systemctl --user start stt-backend (and watch make logs)",
+			fix:  "run `stt start`",
 		}
 	}
 	return checkResult{name: "stt-server", ok: true, msg: "healthy at " + cfg.Server.URL}
 }
 
 func checkDaemon() checkResult {
+	procs, procErr := findDaemonProcesses()
 	sock := config.SocketPath()
 	if _, err := os.Stat(sock); err != nil {
+		if procErr == nil && len(procs) > 0 {
+			return checkResult{
+				name: "stt daemon",
+				ok:   false,
+				msg:  fmt.Sprintf("socket missing, but daemon process pid(s)=%s still exist", formatPIDs(daemonProcessPIDs(procs))),
+				fix:  "run `stt start --no-backend` to stop stale daemons and start one fresh",
+			}
+		}
 		return checkResult{
 			name: "stt daemon",
 			ok:   false,
 			msg:  "socket not present at " + sock,
-			fix:  "systemctl --user start stt-daemon (or run `stt daemon`)",
+			fix:  "run `stt start`",
 		}
 	}
 	cli := ipc.NewClient(sock)
-	resp, err := cli.Status()
+	resp, err := cli.Monitor()
 	if err != nil {
+		if procErr == nil && len(procs) > 0 {
+			return checkResult{
+				name: "stt daemon",
+				ok:   false,
+				msg:  fmt.Sprintf("socket is not reachable, but daemon process pid(s)=%s still exist", formatPIDs(daemonProcessPIDs(procs))),
+				fix:  "run `stt start --no-backend` to stop stale daemons and start one fresh",
+			}
+		}
 		return checkResult{name: "stt daemon", ok: false, msg: err.Error()}
+	}
+	if procErr != nil {
+		return checkResult{
+			name: "stt daemon",
+			ok:   false,
+			msg:  "running, but process scan failed: " + procErr.Error(),
+			fix:  "ensure /proc is mounted and readable",
+		}
+	}
+	if len(procs) > 1 {
+		pid := "-"
+		fix := "run `stt start --no-backend` to keep the reachable daemon and stop stale duplicates"
+		if resp.PID > 0 {
+			pid = fmt.Sprintf("%d", resp.PID)
+		} else {
+			fix = "run `stt shutdown --no-backend` and then `stt start --no-backend`"
+		}
+		return checkResult{
+			name: "stt daemon",
+			ok:   false,
+			msg:  fmt.Sprintf("multiple daemon processes: socket pid=%s all pid(s)=%s", pid, formatPIDs(daemonProcessPIDs(procs))),
+			fix:  fix,
+		}
+	}
+	if len(procs) == 1 && resp.PID > 0 && procs[0].PID != resp.PID {
+		return checkResult{
+			name: "stt daemon",
+			ok:   false,
+			msg:  fmt.Sprintf("socket reports pid=%d, but process scan found pid=%d", resp.PID, procs[0].PID),
+			fix:  "run `stt start --no-backend` to stop stale daemons and start one fresh",
+		}
+	}
+	msg := fmt.Sprintf("running, state=%s, streams=%d", resp.State, len(resp.Streams))
+	if resp.PID > 0 {
+		msg = fmt.Sprintf("running, pid=%d, state=%s, streams=%d", resp.PID, resp.State, len(resp.Streams))
 	}
 	return checkResult{
 		name: "stt daemon",
 		ok:   true,
-		msg:  fmt.Sprintf("running, state=%s, streams=%d", resp.State, resp.StreamCount),
+		msg:  msg,
 	}
 }
 

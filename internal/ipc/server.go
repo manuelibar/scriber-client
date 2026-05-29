@@ -4,27 +4,33 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
+
+	"scriber/internal/persist"
 )
 
 // Registry is what the IPC server needs from the daemon's stream registry.
 type Registry interface {
 	Attach(req *AttachRequest) (*Stream, string, error)
-	Detach(name, targetRef string) error
+	Detach(name, targetRef string, slot int) error
 	DetachAll() error
-	Streams() ([]Stream, string)
+	Streams() ([]Stream, string, int)
 	Select(name string) (string, error)
 	SetSlot(name string, slot int) (*Stream, error)
 	ClearSlot(name string) (*Stream, error)
 	SelectSlot(slot int) (string, error)
 	Cycle() (string, error)
+	SendTextToActive(text string) (string, error)
 }
 
-// DaemonState reflects what the IPC server reports for `stt status`.
+// DaemonState reflects what the IPC server reports to `stt monitor`.
 type DaemonState interface {
 	State() string
 	RecordingStartedAt() time.Time
@@ -34,13 +40,19 @@ type DaemonState interface {
 }
 
 type Server struct {
-	socketPath string
-	reg        Registry
-	dmn        DaemonState
+	socketPath     string
+	transcriptsDir string
+	reg            Registry
+	dmn            DaemonState
+	shutdown       func()
 }
 
-func NewServer(socketPath string, reg Registry, dmn DaemonState) *Server {
-	return &Server{socketPath: socketPath, reg: reg, dmn: dmn}
+func NewServer(socketPath string, reg Registry, dmn DaemonState, shutdown func(), transcriptsDir ...string) *Server {
+	dir := ""
+	if len(transcriptsDir) > 0 {
+		dir = transcriptsDir[0]
+	}
+	return &Server{socketPath: socketPath, transcriptsDir: dir, reg: reg, dmn: dmn, shutdown: shutdown}
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -59,13 +71,14 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/attach", s.handleAttach)
 	mux.HandleFunc("/detach", s.handleDetach)
-	mux.HandleFunc("/streams", s.handleStreams)
 	mux.HandleFunc("/select", s.handleSelect)
 	mux.HandleFunc("/stream/set-slot", s.handleSetSlot)
 	mux.HandleFunc("/stream/clear-slot", s.handleClearSlot)
 	mux.HandleFunc("/slot/select", s.handleSelectSlot)
 	mux.HandleFunc("/cycle", s.handleCycle)
-	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/monitor", s.handleMonitor)
+	mux.HandleFunc("/paste", s.handlePaste)
+	mux.HandleFunc("/shutdown", s.handleShutdown)
 
 	srv := &http.Server{Handler: mux}
 	go func() {
@@ -118,16 +131,11 @@ func (s *Server) handleDetach(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	if err := s.reg.Detach(req.Name, req.TargetRef); err != nil {
+	if err := s.reg.Detach(req.Name, req.TargetRef, req.Slot); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-func (s *Server) handleStreams(w http.ResponseWriter, r *http.Request) {
-	streams, active := s.reg.Streams()
-	writeJSON(w, http.StatusOK, ListResponse{Active: active, Streams: streams})
 }
 
 func (s *Server) handleSelect(w http.ResponseWriter, r *http.Request) {
@@ -195,29 +203,116 @@ func (s *Server) handleCycle(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, CycleResponse{Active: active})
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	streams, active := s.reg.Streams()
-	activeSlot := 0
-	for _, stream := range streams {
-		if stream.Name == active {
-			activeSlot = stream.Slot
-			break
-		}
+func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
+	historyQuery, loadHistory, err := parseMonitorHistoryQuery(r.URL.Query())
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
 	}
+	streams, active, activeSlot := s.reg.Streams()
 	recordingMs := 0
 	if started := s.dmn.RecordingStartedAt(); !started.IsZero() {
 		recordingMs = int(time.Since(started) / time.Millisecond)
 	}
 	last, lastAt := s.dmn.LastTranscript()
-	writeJSON(w, http.StatusOK, StatusResponse{
-		State:            s.dmn.State(),
-		Active:           active,
-		ActiveSlot:       activeSlot,
-		RecordingMs:      recordingMs,
-		AudioLevel:       s.dmn.AudioLevel(),
-		StreamCount:      len(streams),
-		LastTranscript:   last,
-		LastTranscriptAt: lastAt,
-		ServerOK:         s.dmn.ServerOK(),
+	transcripts, historyLoaded, historyErr := s.monitorTranscripts(historyQuery, loadHistory)
+	writeJSON(w, http.StatusOK, MonitorResponse{
+		State:                   s.dmn.State(),
+		PID:                     os.Getpid(),
+		Active:                  active,
+		ActiveSlot:              activeSlot,
+		RecordingMs:             recordingMs,
+		AudioLevel:              s.dmn.AudioLevel(),
+		Streams:                 streams,
+		Transcripts:             transcripts,
+		TranscriptHistoryLoaded: historyLoaded,
+		TranscriptHistoryError:  historyErr,
+		LastTranscript:          last,
+		LastTranscriptAt:        lastAt,
+		ServerOK:                s.dmn.ServerOK(),
 	})
+}
+
+func parseMonitorHistoryQuery(values url.Values) (persist.HistoryQuery, bool, error) {
+	rawLimit := values.Get("history_limit")
+	rawSince := values.Get("history_since")
+	rawStream := values.Get("history_stream")
+	if rawLimit == "" && rawSince == "" && rawStream == "" {
+		return persist.HistoryQuery{}, false, nil
+	}
+
+	query := persist.HistoryQuery{Limit: 200}
+	if rawLimit != "" {
+		limit, err := strconv.Atoi(rawLimit)
+		if err != nil || limit < 0 {
+			return persist.HistoryQuery{}, false, fmt.Errorf("history_limit must be zero or greater")
+		}
+		if limit == 0 {
+			return persist.HistoryQuery{}, false, nil
+		}
+		query.Limit = limit
+	}
+	if rawSince != "" {
+		since, err := time.Parse(time.RFC3339Nano, rawSince)
+		if err != nil {
+			return persist.HistoryQuery{}, false, fmt.Errorf("history_since must be RFC3339Nano: %w", err)
+		}
+		query.From = since
+	}
+	query.Stream = rawStream
+	return query, true, nil
+}
+
+func (s *Server) monitorTranscripts(query persist.HistoryQuery, load bool) ([]TranscriptEntry, bool, string) {
+	if !load || s.transcriptsDir == "" {
+		return nil, false, ""
+	}
+
+	records, err := persist.QueryHistory(s.transcriptsDir, query)
+	if err != nil {
+		return nil, false, err.Error()
+	}
+
+	out := make([]TranscriptEntry, 0, len(records))
+	for _, rec := range records {
+		out = append(out, TranscriptEntry{
+			Timestamp:   rec.Timestamp,
+			AudioMs:     rec.AudioMs,
+			Stream:      rec.TargetStream,
+			TargetType:  rec.TargetType,
+			TargetRef:   rec.TargetRef,
+			Mode:        rec.Mode,
+			Success:     rec.Success,
+			Error:       rec.Error,
+			InferenceMs: rec.InferenceMs,
+			Transcript:  rec.Transcript,
+		})
+	}
+	return out, true, ""
+}
+
+func (s *Server) handlePaste(w http.ResponseWriter, r *http.Request) {
+	var req PasteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	stream, err := s.reg.SendTextToActive(req.Text)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, PasteResponse{Stream: stream, Chars: len(req.Text)})
+}
+
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if s.shutdown == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("shutdown unavailable"))
+		return
+	}
+	writeJSON(w, http.StatusOK, ShutdownResponse{OK: true})
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		s.shutdown()
+	}()
 }

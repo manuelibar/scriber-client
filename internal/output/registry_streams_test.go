@@ -1,6 +1,8 @@
 package output
 
 import (
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -51,10 +53,13 @@ func TestAttachCreatesAndSelectsNamedStream(t *testing.T) {
 	if stream.Target.TargetType != ipc.TargetTypePTY || stream.Target.TargetRef != "/tmp/workbench.sock" {
 		t.Fatalf("target = %+v, want pty /tmp/workbench.sock", stream.Target)
 	}
+	if stream.Slot != 1 {
+		t.Fatalf("slot = %d, want first one-based slot 1", stream.Slot)
+	}
 
-	streams, active := reg.Streams()
-	if active != "workbench" {
-		t.Fatalf("active = %q, want workbench", active)
+	streams, active, activeSlot := reg.Streams()
+	if active != "workbench" || activeSlot != 1 {
+		t.Fatalf("active = %q slot=%d, want workbench slot=1", active, activeSlot)
 	}
 	if len(streams) != 1 || streams[0].Name != "workbench" {
 		t.Fatalf("streams = %+v, want one workbench stream", streams)
@@ -65,20 +70,169 @@ func TestAttachCreatesAndSelectsNamedStream(t *testing.T) {
 	}
 }
 
-func TestAttachWithoutNameGeneratesTerminalName(t *testing.T) {
-	reg := newTestRegistry(t, fakeTargetBackend{alive: map[string]bool{"/tmp/term.sock": true}})
+func TestAttachAssignsFirstAvailableOneBasedSlot(t *testing.T) {
+	reg := newTestRegistry(t, fakeTargetBackend{
+		alive: map[string]bool{
+			"/tmp/one.sock":   true,
+			"/tmp/two.sock":   true,
+			"/tmp/three.sock": true,
+		},
+	})
+	if _, _, err := reg.Attach(attachReq("one", "/tmp/one.sock")); err != nil {
+		t.Fatalf("Attach(one) error = %v", err)
+	}
+	if _, _, err := reg.Attach(attachReq("two", "/tmp/two.sock")); err != nil {
+		t.Fatalf("Attach(two) error = %v", err)
+	}
+	if _, err := reg.ClearSlot("one"); err != nil {
+		t.Fatalf("ClearSlot(one) error = %v", err)
+	}
+	three, _, err := reg.Attach(attachReq("three", "/tmp/three.sock"))
+	if err != nil {
+		t.Fatalf("Attach(three) error = %v", err)
+	}
+	if three.Slot != 1 {
+		t.Fatalf("slot = %d, want first available slot 1", three.Slot)
+	}
+}
 
-	stream, _, err := reg.Attach(&ipc.AttachRequest{
+func TestAttachWithoutNameUsesFirstAvailableSlotWithoutAssigningName(t *testing.T) {
+	reg := newTestRegistry(t, fakeTargetBackend{alive: map[string]bool{
+		"/tmp/one.sock": true,
+		"/tmp/two.sock": true,
+	}})
+
+	first, _, err := reg.Attach(&ipc.AttachRequest{
 		PID:        4321,
-		TTY:        "/dev/pts/3",
+		TTY:        "/dev/pts/8",
 		TargetType: ipc.TargetTypePTY,
-		TargetRef:  "/tmp/term.sock",
+		TargetRef:  "/tmp/one.sock",
 	})
 	if err != nil {
-		t.Fatalf("Attach() error = %v", err)
+		t.Fatalf("Attach(first) error = %v", err)
 	}
-	if stream.Name != "term-3" {
-		t.Fatalf("generated stream name = %q, want term-3", stream.Name)
+	if first.Name != "" || first.Slot != 1 {
+		t.Fatalf("first stream name=%q slot=%d, want empty name slot=1", first.Name, first.Slot)
+	}
+
+	second, _, err := reg.Attach(&ipc.AttachRequest{
+		PID:        4322,
+		TTY:        "/dev/pts/1",
+		TargetType: ipc.TargetTypePTY,
+		TargetRef:  "/tmp/two.sock",
+	})
+	if err != nil {
+		t.Fatalf("Attach(second) error = %v", err)
+	}
+	if second.Name != "" || second.Slot != 2 {
+		t.Fatalf("second stream name=%q slot=%d, want empty name slot=2", second.Name, second.Slot)
+	}
+
+	streams, active, activeSlot := reg.Streams()
+	if len(streams) != 2 {
+		t.Fatalf("streams len = %d, want 2", len(streams))
+	}
+	if active != "slot 2" || activeSlot != 2 {
+		t.Fatalf("active = %q slot=%d, want slot 2 / 2", active, activeSlot)
+	}
+	if streams[0].ID != "stream_slot_1" || streams[1].ID != "stream_slot_2" {
+		t.Fatalf("stream IDs = [%q %q], want slot IDs", streams[0].ID, streams[1].ID)
+	}
+}
+
+func TestDetachBySlotRemovesUnnamedStream(t *testing.T) {
+	reg := newTestRegistry(t, fakeTargetBackend{alive: map[string]bool{
+		"/tmp/one.sock": true,
+		"/tmp/two.sock": true,
+	}})
+	if _, _, err := reg.Attach(&ipc.AttachRequest{TargetType: ipc.TargetTypePTY, TargetRef: "/tmp/one.sock"}); err != nil {
+		t.Fatalf("Attach(first) error = %v", err)
+	}
+	if _, _, err := reg.Attach(&ipc.AttachRequest{TargetType: ipc.TargetTypePTY, TargetRef: "/tmp/two.sock"}); err != nil {
+		t.Fatalf("Attach(second) error = %v", err)
+	}
+
+	if err := reg.Detach("", "", 1); err != nil {
+		t.Fatalf("Detach(slot 1) error = %v", err)
+	}
+
+	streams, active, activeSlot := reg.Streams()
+	if len(streams) != 1 {
+		t.Fatalf("streams len = %d, want 1", len(streams))
+	}
+	if streams[0].Slot != 2 {
+		t.Fatalf("remaining slot = %d, want 2", streams[0].Slot)
+	}
+	if active != "slot 2" || activeSlot != 2 {
+		t.Fatalf("active = %q slot=%d, want slot 2 / 2", active, activeSlot)
+	}
+}
+
+func TestLoadDoesNotBackfillSlotlessStreams(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "registry.json")
+	state := struct {
+		ActiveStream string       `json:"active_stream,omitempty"`
+		Streams      []ipc.Stream `json:"streams,omitempty"`
+	}{
+		ActiveStream: "alpha",
+		Streams: []ipc.Stream{
+			{
+				Name:   "alpha",
+				Status: ipc.StreamStatusActive,
+				Target: ipc.Target{
+					TargetType: ipc.TargetTypePTY,
+					TargetRef:  "/tmp/alpha.sock",
+				},
+			},
+			{
+				Name:   "beta",
+				Status: ipc.StreamStatusActive,
+				Target: ipc.Target{
+					TargetType: ipc.TargetTypePTY,
+					TargetRef:  "/tmp/beta.sock",
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reg, err := NewRegistryWithBackend(path, fakeTargetBackend{})
+	if err != nil {
+		t.Fatalf("NewRegistryWithBackend() error = %v", err)
+	}
+	streams, active, activeSlot := reg.Streams()
+	if active != "alpha" || activeSlot != 0 {
+		t.Fatalf("active = %q slot=%d, want alpha slot=0", active, activeSlot)
+	}
+	if len(streams) != 2 {
+		t.Fatalf("streams len = %d, want 2", len(streams))
+	}
+	if streams[0].Slot != 0 || streams[1].Slot != 0 {
+		t.Fatalf("slots = [%d %d], want [0 0]", streams[0].Slot, streams[1].Slot)
+	}
+
+	var persisted struct {
+		ActiveStream string       `json:"active_stream,omitempty"`
+		Streams      []ipc.Stream `json:"streams,omitempty"`
+	}
+	persistedData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(persistedData, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ActiveStream != "alpha" {
+		t.Fatalf("persisted active = %q, want alpha", persisted.ActiveStream)
+	}
+	if len(persisted.Streams) != 2 || persisted.Streams[0].Slot != 0 || persisted.Streams[1].Slot != 0 {
+		t.Fatalf("persisted streams = %+v, want slotless streams", persisted.Streams)
 	}
 }
 
@@ -130,7 +284,7 @@ func TestSetSlotAndSelectSlotOperateOnStreams(t *testing.T) {
 	if _, err := reg.SetSlot("notes", 1); err != nil {
 		t.Fatalf("SetSlot(notes, 1) error = %v", err)
 	}
-	streams, _ := reg.Streams()
+	streams, _, _ := reg.Streams()
 	slots := map[string]int{}
 	for _, s := range streams {
 		slots[s.Name] = s.Slot
@@ -160,14 +314,14 @@ func TestPruneDeadMarksStreamDeadWithoutDeletingName(t *testing.T) {
 	if len(dead) != 1 || dead[0] != "codex-main" {
 		t.Fatalf("PruneDead() = %v, want [codex-main]", dead)
 	}
-	streams, active := reg.Streams()
+	streams, active, activeSlot := reg.Streams()
 	if len(streams) != 1 || streams[0].Name != "codex-main" {
 		t.Fatalf("streams after prune = %+v, want name preserved", streams)
 	}
 	if streams[0].Status != ipc.StreamStatusDead {
 		t.Fatalf("status after prune = %q, want dead", streams[0].Status)
 	}
-	if active != "" {
-		t.Fatalf("active after pruning only live stream = %q, want empty", active)
+	if active != "" || activeSlot != 0 {
+		t.Fatalf("active after pruning only live stream = %q slot=%d, want empty slot=0", active, activeSlot)
 	}
 }

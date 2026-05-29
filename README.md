@@ -31,33 +31,35 @@ This intentionally installs `stt`, not `scriber`, to avoid clobbering any existi
 ## Run
 
 ```bash
-stt daemon
-stt daemon --transcripts-dir ~/.local/state/stt/transcripts
+stt start
+stt attach [NAME]
 ```
 
-Systemd user services are installed from the repo root:
+Stop everything started by `stt start`:
 
 ```bash
-cd ..
-make services-install
-make services-start
-journalctl --user -u stt-daemon -f
+stt shutdown
 ```
+
+For foreground daemon debugging, run `stt daemon` directly.
 
 ## CLI
 
 ```bash
+stt start                  # start Docker backend and host daemon
+stt shutdown               # gracefully stop daemon and Docker backend
 stt daemon [--transcripts-dir DIR]
-stt attach NAME           # start an STT-managed terminal stream and select it
-stt attach NAME -- codex  # run a command inside the managed terminal
-stt detach NAME           # remove a stream
+stt attach [NAME]         # start an STT-managed terminal stream and select it
+stt attach [NAME] -- codex # run a command inside the managed terminal
+stt detach NAME|SLOT      # remove a stream by name or slot number
 stt stream set-slot NAME N
 stt stream clear-slot NAME
-stt streams               # list streams; selected stream marked with *
 stt select NAME           # select the one stream that receives final text
 stt cycle                 # rotate selection to next live stream
-stt status                # daemon state, active stream, server health
-stt monitor               # live selected stream, duration, and audio level
+stt paste [N]             # paste the last N non-empty transcripts; default 1
+stt history prune         # preview and delete transcript history after confirmation
+stt monitor               # live daemon state, streams, selected target, session history, and audio level
+stt monitor --once        # print one combined snapshot and exit
 stt doctor                # diagnose setup
 ```
 
@@ -70,7 +72,8 @@ hotkey:
   device: auto
   talk_key: KEY_RIGHTCTRL
   cycle_key: KEY_RIGHTMETA
-  hold_threshold_ms: 180
+  cancel_key: KEY_ESC
+  hold_threshold_ms: 1000
   double_tap_window_ms: 350
 
 audio:
@@ -98,12 +101,12 @@ Start a managed terminal stream:
 stt attach codex-main
 ```
 
-This replaces the current terminal with a shell running inside an STT-owned PTY. Anything you run inside that shell, including `codex`, receives dictated text through the PTY input path.
+This replaces the current terminal with a shell running inside an STT-owned PTY. If `NAME` is omitted, the stream remains unnamed and is identified by its assigned slot. Anything you run inside that shell, including `codex`, receives dictated text through the PTY input path.
 
 From another terminal:
 
 ```bash
-stt streams
+stt monitor --once
 ```
 
 Create another managed stream, then select where final dictation goes:
@@ -113,22 +116,43 @@ stt attach notes
 stt stream set-slot codex-main 1
 stt stream set-slot notes 2
 stt select codex-main
+stt detach 2
 ```
 
 Only the selected stream receives final text when recording stops. Scriber/STT never presses Enter; review before submitting.
 
+To replay recent dictation into the selected stream:
+
+```bash
+stt paste      # paste the latest non-empty transcript
+stt paste 3    # paste the last 3, oldest-to-newest, separated by spaces
+```
+
+`stt monitor` starts its transcript history at monitor launch, keeps the stats/stream header visible, and stacks a sliding history window under each attached terminal. Entries are separated by dashed timestamp/status lines. Use `stt monitor --history-limit 20` to keep only 20 session records, `--history-limit 0` to hide history, or `--history-stream NAME` to show one stream's session history.
+
+To prune transcript JSON/WAV history:
+
+```bash
+stt history prune --dry-run
+stt history prune --empty
+stt history prune --older-than 7d --force
+stt history prune --keep-last 50 --force
+```
+
+Without filters, `stt history prune` targets all transcript history in the configured transcript directory. It prints exact record/file/byte stats and asks for confirmation unless `--force` is passed. Useful filters include `--empty`, `--failed`, `--successful`, `--stream NAME`, `--before DATE`, `--older-than DURATION`, `--keep-last N`, and `--orphan-audio`.
+
 ## Hotkey behavior
 
-- Hold the talk key (default `KEY_RIGHTCTRL`) to record; release to transcribe.
-- Double-tap the talk key to start a locked recording; single-tap to stop.
+- Hold the talk key (default `KEY_RIGHTCTRL`) for one second to record; release to transcribe.
+- Tap, then hold the talk key for one second to start a locked recording; tap once to stop.
+- Press the cancel key (default `KEY_ESC`) to discard the current capture.
 - Tap the cycle key (default `KEY_RIGHTMETA`) to rotate the selected stream.
-- Press right-Ctrl + number 1-9 to select a stream assigned with `stt stream set-slot NAME N`; the chord cancels any capture started by that key press.
+- Press right-Ctrl + number 1-9 to select an assigned stream; new streams take the first free slot automatically, and the chord cancels any capture started by that key press.
+- Press right-Ctrl + 0 to show the selected target as a desktop notification; the chord also cancels any capture started by that key press.
 
 ## Operational checks
 
 ```bash
-stt status
-stt monitor
+stt monitor --once
 stt doctor
-journalctl --user -u stt-daemon -f
 ```
