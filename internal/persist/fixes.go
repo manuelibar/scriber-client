@@ -59,20 +59,20 @@ func SelectFixMessages(dir, fromStream string, last int, separator string) (FixS
 	if err != nil {
 		return FixSelection{}, err
 	}
-	delivered := make([]Record, 0, len(records))
+	visible := make([]Record, 0, len(records))
 	for _, rec := range records {
-		if !isDeliveredTranscript(rec) {
+		if !isVisibleOwnedTranscript(rec) {
 			continue
 		}
-		delivered = append(delivered, rec)
+		visible = append(visible, rec)
 	}
-	if len(delivered) == 0 {
-		return FixSelection{}, fmt.Errorf("no delivered transcript messages owned by stream %q", fromStream)
+	if len(visible) == 0 {
+		return FixSelection{}, fmt.Errorf("no visible owned transcript messages for stream %q", fromStream)
 	}
-	if len(delivered) < last {
-		return FixSelection{}, fmt.Errorf("stream %q has only %d delivered transcript messages", fromStream, len(delivered))
+	if len(visible) < last {
+		return FixSelection{}, fmt.Errorf("stream %q has only %d visible owned transcript messages", fromStream, len(visible))
 	}
-	selected := delivered[len(delivered)-last:]
+	selected := visible[len(visible)-last:]
 	parts := make([]string, 0, len(selected))
 	for _, rec := range selected {
 		parts = append(parts, strings.TrimSpace(rec.Transcript))
@@ -182,7 +182,7 @@ func computeOwnedHistory(records []Record) []Record {
 	return out
 }
 
-func isDeliveredTranscript(rec Record) bool {
+func isVisibleOwnedTranscript(rec Record) bool {
 	return rec.Type != "fix" &&
 		rec.Success &&
 		rec.Error == "" &&

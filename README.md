@@ -159,8 +159,8 @@ stt paste 3    # stage the last 3, oldest-to-newest, separated by spaces
 Raw checkpoint diagnostics are not selected by `stt paste`, `stt history ls`, or
 the monitor history window.
 
-To move the last delivered messages from one stream's history to another and
-stage that text in the destination stream buffer:
+To move the last visible owned messages from one stream's history to another
+and stage that text in the destination stream buffer:
 
 ```bash
 stt fix --from notes --to codex-main --last 3

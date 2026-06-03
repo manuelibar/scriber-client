@@ -301,7 +301,7 @@ func fixCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&from, "from", "", "source stream; defaults visibly to the active stream")
 	c.Flags().StringVar(&to, "to", "", "destination stream")
-	c.Flags().IntVar(&last, "last", 1, "number of latest delivered messages to fix")
+	c.Flags().IntVar(&last, "last", 1, "number of latest visible owned messages to fix")
 	c.Flags().StringVar(&separator, "separator", " ", "text inserted between messages; supports \\n, \\r, and \\t escapes")
 	return c
 }
