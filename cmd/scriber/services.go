@@ -115,6 +115,7 @@ func resolveRepoDir(explicit string) (string, error) {
 		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, "Projects", "personal", "scriber"))
 		candidates = append(candidates, filepath.Join(home, "Projects", "scriber"))
 	}
 
@@ -157,7 +158,7 @@ func ensurePrivateConfig(repo string) error {
 
 	envPath := filepath.Join(privateDir, ".env")
 	if _, err := os.Stat(envPath); errors.Is(err, os.ErrNotExist) {
-		env := "STT_WHISPER_MODEL=base.en\n" +
+		env := "STT_WHISPER_MODEL=base\n" +
 			"STT_WHISPER_DEVICE=auto\n" +
 			"STT_WHISPER_LANGUAGE=en\n" +
 			"STT_SILENCE_RMS_THRESHOLD=0.0005\n" +

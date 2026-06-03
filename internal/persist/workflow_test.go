@@ -74,7 +74,7 @@ func TestCaptureStoreRecoverShortInflightAudioFails(t *testing.T) {
 	}
 }
 
-func TestRedemptionMovesOwnershipWithAppendOnlyRecord(t *testing.T) {
+func TestFixMovesOwnershipWithAppendOnlyRecord(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
 	records := []Record{
@@ -88,15 +88,15 @@ func TestRedemptionMovesOwnershipWithAppendOnlyRecord(t *testing.T) {
 		}
 	}
 
-	selection, err := SelectRedemptionMessages(dir, "notes", 1, "\n")
+	selection, err := SelectFixMessages(dir, "notes", 1, "\n")
 	if err != nil {
-		t.Fatalf("SelectRedemptionMessages() error = %v", err)
+		t.Fatalf("SelectFixMessages() error = %v", err)
 	}
 	if selection.Text != "two" || len(selection.Messages) != 1 || selection.Messages[0].MessageID != "a2" {
 		t.Fatalf("selection = %+v, want message a2 text two", selection)
 	}
-	if _, err := SaveRedemption(dir, "notes", "codex-main", selection.Messages, selection.Text); err != nil {
-		t.Fatalf("SaveRedemption() error = %v", err)
+	if _, err := SaveFix(dir, "notes", "codex-main", selection.Messages, selection.Text); err != nil {
+		t.Fatalf("SaveFix() error = %v", err)
 	}
 
 	notes, err := QueryOwnedHistory(dir, HistoryQuery{Stream: "notes"})
@@ -110,7 +110,41 @@ func TestRedemptionMovesOwnershipWithAppendOnlyRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryOwnedHistory(codex-main) error = %v", err)
 	}
-	if len(codex) != 2 || codex[0].MessageID != "a2" || codex[0].RedeemedFrom != "notes" || codex[0].RedeemedTo != "codex-main" || codex[1].MessageID != "b1" {
-		t.Fatalf("codex owned records = %+v, want redeemed a2 plus existing", codex)
+	if len(codex) != 2 || codex[0].MessageID != "a2" || codex[0].FixedFrom != "notes" || codex[0].FixedTo != "codex-main" || codex[1].MessageID != "b1" {
+		t.Fatalf("codex owned records = %+v, want fixed a2 plus existing", codex)
+	}
+}
+
+func TestCaptureStoreRecoverCommandCaptureQueuesCommand(t *testing.T) {
+	store := NewCaptureStore(t.TempDir())
+	writer, err := store.NewCaptureWithOptions(16000, CaptureOptions{
+		Kind:         CaptureKindCommand,
+		TargetStream: "codex",
+	})
+	if err != nil {
+		t.Fatalf("NewCaptureWithOptions() error = %v", err)
+	}
+	meta, err := writer.FinalizeWithPCM(make([]byte, 320))
+	if err != nil {
+		t.Fatalf("FinalizeWithPCM() error = %v", err)
+	}
+	if _, err := store.Update(meta.CaptureID, func(next *CaptureMeta) {
+		next.Kind = CaptureKindCommand
+		next.Stage = StageTranscribed
+		next.TargetStream = "codex"
+		next.Transcript = "delete last staged sentence"
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := store.Recover(2)
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if len(plan.Command) != 1 || plan.Command[0].Stage != StageQueuedForCommand || plan.Command[0].TargetStream != "codex" {
+		t.Fatalf("command recovery = %+v, want one queued command capture", plan.Command)
+	}
+	if len(plan.Delivery) != 0 {
+		t.Fatalf("delivery recovery = %+v, want none", plan.Delivery)
 	}
 }

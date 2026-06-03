@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-type RedemptionSelection struct {
+type FixSelection struct {
 	Messages []Record
 	Text     string
 }
@@ -16,6 +16,9 @@ type RedemptionSelection struct {
 func QueryOwnedHistory(dir string, query HistoryQuery) ([]Record, error) {
 	if query.Limit < 0 {
 		return nil, fmt.Errorf("limit must be zero or greater")
+	}
+	if query.Offset < 0 {
+		return nil, fmt.Errorf("offset must be zero or greater")
 	}
 	all, err := QueryHistory(dir, HistoryQuery{IncludeEmpty: true})
 	if err != nil {
@@ -42,22 +45,19 @@ func QueryOwnedHistory(dir string, query HistoryQuery) ([]Record, error) {
 		}
 		filtered = append(filtered, rec)
 	}
-	if query.Limit > 0 && len(filtered) > query.Limit {
-		filtered = filtered[len(filtered)-query.Limit:]
-	}
-	return filtered, nil
+	return applyHistoryWindow(filtered, query.Limit, query.Offset), nil
 }
 
-func SelectRedemptionMessages(dir, fromStream string, last int, separator string) (RedemptionSelection, error) {
+func SelectFixMessages(dir, fromStream string, last int, separator string) (FixSelection, error) {
 	if strings.TrimSpace(fromStream) == "" {
-		return RedemptionSelection{}, fmt.Errorf("source stream is required")
+		return FixSelection{}, fmt.Errorf("source stream is required")
 	}
 	if last <= 0 {
-		return RedemptionSelection{}, fmt.Errorf("last must be positive")
+		return FixSelection{}, fmt.Errorf("last must be positive")
 	}
 	records, err := QueryOwnedHistory(dir, HistoryQuery{Stream: fromStream})
 	if err != nil {
-		return RedemptionSelection{}, err
+		return FixSelection{}, err
 	}
 	delivered := make([]Record, 0, len(records))
 	for _, rec := range records {
@@ -67,23 +67,23 @@ func SelectRedemptionMessages(dir, fromStream string, last int, separator string
 		delivered = append(delivered, rec)
 	}
 	if len(delivered) == 0 {
-		return RedemptionSelection{}, fmt.Errorf("no delivered transcript messages owned by stream %q", fromStream)
+		return FixSelection{}, fmt.Errorf("no delivered transcript messages owned by stream %q", fromStream)
 	}
 	if len(delivered) < last {
-		return RedemptionSelection{}, fmt.Errorf("stream %q has only %d delivered transcript messages", fromStream, len(delivered))
+		return FixSelection{}, fmt.Errorf("stream %q has only %d delivered transcript messages", fromStream, len(delivered))
 	}
 	selected := delivered[len(delivered)-last:]
 	parts := make([]string, 0, len(selected))
 	for _, rec := range selected {
 		parts = append(parts, strings.TrimSpace(rec.Transcript))
 	}
-	return RedemptionSelection{
+	return FixSelection{
 		Messages: selected,
 		Text:     strings.Join(parts, separator),
 	}, nil
 }
 
-func SaveRedemption(dir string, fromStream, toStream string, messages []Record, text string) (*RedemptionRecord, error) {
+func SaveFix(dir string, fromStream, toStream string, messages []Record, text string) (*FixRecord, error) {
 	if strings.TrimSpace(fromStream) == "" {
 		return nil, fmt.Errorf("source stream is required")
 	}
@@ -98,11 +98,11 @@ func SaveRedemption(dir string, fromStream, toStream string, messages []Record, 
 		ids = append(ids, RecordMessageID(msg))
 	}
 	now := time.Now().UTC()
-	id, err := newRedemptionID(now)
+	id, err := newFixID(now)
 	if err != nil {
 		return nil, err
 	}
-	redemption := &RedemptionRecord{
+	fix := &FixRecord{
 		ID:         id,
 		At:         now,
 		FromStream: fromStream,
@@ -111,17 +111,17 @@ func SaveRedemption(dir string, fromStream, toStream string, messages []Record, 
 		Text:       text,
 	}
 	rec := Record{
-		Timestamp:  now,
-		MessageID:  id,
-		Type:       "redemption",
-		Redemption: redemption,
-		Mode:       "history",
-		Success:    true,
+		Timestamp: now,
+		MessageID: id,
+		Type:      "fix",
+		Fix:       fix,
+		Mode:      "history",
+		Success:   true,
 	}
 	if err := Save(dir, rec); err != nil {
 		return nil, err
 	}
-	return redemption, nil
+	return fix, nil
 }
 
 func RecordMessageID(rec Record) string {
@@ -143,22 +143,25 @@ func computeOwnedHistory(records []Record) []Record {
 	messages := map[string]messageState{}
 	out := make([]Record, 0, len(records))
 	for _, rec := range records {
-		if rec.Type == "redemption" && rec.Redemption != nil {
-			redemption := rec.Redemption
-			for _, id := range redemption.MessageIDs {
+		if rec.Type == "fix" && rec.Fix != nil {
+			fix := rec.Fix
+			for _, id := range fix.MessageIDs {
 				state, ok := messages[id]
 				if !ok {
 					continue
 				}
-				if state.owner != redemption.FromStream {
+				if state.owner != fix.FromStream {
 					continue
 				}
-				state.owner = redemption.ToStream
+				state.owner = fix.ToStream
 				messages[id] = state
 				out[state.index].OwnedStream = state.owner
-				out[state.index].RedeemedFrom = state.original
-				out[state.index].RedeemedTo = state.owner
+				out[state.index].FixedFrom = state.original
+				out[state.index].FixedTo = state.owner
 			}
+			continue
+		}
+		if rec.Type != "" && rec.Type != "transcript" {
 			continue
 		}
 		if strings.TrimSpace(rec.Transcript) == "" {
@@ -180,17 +183,17 @@ func computeOwnedHistory(records []Record) []Record {
 }
 
 func isDeliveredTranscript(rec Record) bool {
-	return rec.Type != "redemption" &&
+	return rec.Type != "fix" &&
 		rec.Success &&
 		rec.Error == "" &&
 		strings.TrimSpace(rec.Transcript) != "" &&
 		strings.TrimSpace(rec.OwnedStream) != ""
 }
 
-func newRedemptionID(now time.Time) (string, error) {
+func newFixID(now time.Time) (string, error) {
 	var suffix [4]byte
 	if _, err := rand.Read(suffix[:]); err != nil {
-		return "", fmt.Errorf("random redemption id: %w", err)
+		return "", fmt.Errorf("random fix id: %w", err)
 	}
-	return "redeem-" + now.UTC().Format("20060102T150405.000000000Z") + "-" + hex.EncodeToString(suffix[:]), nil
+	return "fix-" + now.UTC().Format("20060102T150405.000000000Z") + "-" + hex.EncodeToString(suffix[:]), nil
 }

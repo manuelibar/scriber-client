@@ -24,7 +24,7 @@ func newRootCmd() *cobra.Command {
 		selectCmd(),
 		cycleCmd(),
 		pasteCmd(),
-		redeemCmd(),
+		fixCmd(),
 		historyCmd(),
 		monitorCmd(),
 		doctorCmd(),

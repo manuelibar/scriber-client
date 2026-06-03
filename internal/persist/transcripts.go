@@ -13,30 +13,30 @@ import (
 )
 
 type Record struct {
-	Timestamp      time.Time         `json:"ts"`
-	MessageID      string            `json:"message_id,omitempty"`
-	CaptureID      string            `json:"capture_id,omitempty"`
-	Stage          string            `json:"stage,omitempty"`
-	AudioMs        int               `json:"audio_ms"`
-	AudioPath      string            `json:"audio_path,omitempty"`
-	AudioSaveError string            `json:"audio_save_error,omitempty"`
-	Transcript     string            `json:"transcript"`
-	Raw            string            `json:"raw,omitempty"`
-	TargetStream   string            `json:"target_stream,omitempty"`
-	TargetType     string            `json:"target_type,omitempty"`
-	TargetRef      string            `json:"target_ref,omitempty"`
-	Mode           string            `json:"mode"` // "pty" | "noop"
-	Success        bool              `json:"success"`
-	Error          string            `json:"error,omitempty"`
-	InferenceMs    int               `json:"inference_ms,omitempty"`
-	Type           string            `json:"type,omitempty"` // "transcript" | "redemption"
-	Redemption     *RedemptionRecord `json:"redemption,omitempty"`
-	OwnedStream    string            `json:"owned_stream,omitempty"`
-	RedeemedFrom   string            `json:"redeemed_from,omitempty"`
-	RedeemedTo     string            `json:"redeemed_to,omitempty"`
+	Timestamp    time.Time  `json:"ts"`
+	MessageID    string     `json:"message_id,omitempty"`
+	CaptureID    string     `json:"capture_id,omitempty"`
+	Stage        string     `json:"stage,omitempty"`
+	AudioMs      int        `json:"audio_ms"`
+	AudioPath    string     `json:"audio_path,omitempty"`
+	Transcript   string     `json:"transcript"`
+	Raw          string     `json:"raw,omitempty"`
+	TargetStream string     `json:"target_stream,omitempty"`
+	TargetType   string     `json:"target_type,omitempty"`
+	TargetRef    string     `json:"target_ref,omitempty"`
+	Language     string     `json:"language,omitempty"`
+	Mode         string     `json:"mode,omitempty"`
+	Success      bool       `json:"success"`
+	Error        string     `json:"error,omitempty"`
+	InferenceMs  int        `json:"inference_ms,omitempty"`
+	Type         string     `json:"type,omitempty"`
+	Fix          *FixRecord `json:"fix,omitempty"`
+	OwnedStream  string     `json:"owned_stream,omitempty"`
+	FixedFrom    string     `json:"fixed_from,omitempty"`
+	FixedTo      string     `json:"fixed_to,omitempty"`
 }
 
-type RedemptionRecord struct {
+type FixRecord struct {
 	ID         string    `json:"id"`
 	At         time.Time `json:"at"`
 	FromStream string    `json:"from_stream"`
@@ -51,6 +51,7 @@ type HistoryQuery struct {
 	Stream       string
 	TargetRef    string
 	Limit        int
+	Offset       int
 	IncludeEmpty bool
 }
 
@@ -73,24 +74,12 @@ func Save(dir string, rec Record) error {
 	return os.Rename(tmp, path)
 }
 
-// NonEmpty returns every non-empty transcript record from dir.
-// Records are returned oldest-to-newest so callers can replay them in reading order.
-func NonEmpty(dir string) ([]Record, error) {
-	return QueryHistory(dir, HistoryQuery{})
-}
-
-// LatestNonEmpty returns up to n non-empty transcript records from dir.
-// Records are returned oldest-to-newest so callers can replay them in reading order.
-func LatestNonEmpty(dir string, n int) ([]Record, error) {
-	if n <= 0 {
-		return nil, fmt.Errorf("count must be positive")
-	}
-	return QueryHistory(dir, HistoryQuery{Limit: n})
-}
-
 func QueryHistory(dir string, query HistoryQuery) ([]Record, error) {
 	if query.Limit < 0 {
 		return nil, fmt.Errorf("limit must be zero or greater")
+	}
+	if query.Offset < 0 {
+		return nil, fmt.Errorf("offset must be zero or greater")
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -121,6 +110,9 @@ func QueryHistory(dir string, query HistoryQuery) ([]Record, error) {
 		if !query.IncludeEmpty && strings.TrimSpace(rec.Transcript) == "" {
 			continue
 		}
+		if !query.IncludeEmpty && rec.Type != "" && rec.Type != "transcript" {
+			continue
+		}
 		if !query.From.IsZero() && at.Before(query.From) {
 			continue
 		}
@@ -142,14 +134,24 @@ func QueryHistory(dir string, query HistoryQuery) ([]Record, error) {
 	sort.SliceStable(records, func(i, j int) bool {
 		return records[i].at.Before(records[j].at)
 	})
-	if query.Limit > 0 && len(records) > query.Limit {
-		records = records[len(records)-query.Limit:]
-	}
+	records = applyHistoryWindow(records, query.Limit, query.Offset)
 	out := make([]Record, len(records))
 	for i, record := range records {
 		out[i] = record.rec
 	}
 	return out, nil
+}
+
+func applyHistoryWindow[T any](records []T, limit, offset int) []T {
+	if offset >= len(records) {
+		return nil
+	}
+	end := len(records) - offset
+	start := 0
+	if limit > 0 && end > limit {
+		start = end - limit
+	}
+	return records[start:end]
 }
 
 type HistoryPruneFilter struct {

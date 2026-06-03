@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"scriber/internal/persist"
@@ -27,7 +28,8 @@ type Registry interface {
 	ClearSlot(name string) (*Stream, error)
 	SelectSlot(slot int) (string, error)
 	Cycle() (string, error)
-	SendTextToActive(text string) (string, error)
+	ActiveStream() *Stream
+	Stream(name string) *Stream
 	SendTextToStream(name, text string) (string, error)
 }
 
@@ -44,6 +46,7 @@ type DaemonState interface {
 type Server struct {
 	socketPath     string
 	transcriptsDir string
+	bufferStore    *persist.BufferStore
 	reg            Registry
 	dmn            DaemonState
 	shutdown       func()
@@ -54,7 +57,11 @@ func NewServer(socketPath string, reg Registry, dmn DaemonState, shutdown func()
 	if len(transcriptsDir) > 0 {
 		dir = transcriptsDir[0]
 	}
-	return &Server{socketPath: socketPath, transcriptsDir: dir, reg: reg, dmn: dmn, shutdown: shutdown}
+	var bufferStore *persist.BufferStore
+	if dir != "" {
+		bufferStore = persist.NewBufferStore(dir)
+	}
+	return &Server{socketPath: socketPath, transcriptsDir: dir, bufferStore: bufferStore, reg: reg, dmn: dmn, shutdown: shutdown}
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -70,20 +77,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/attach", s.handleAttach)
-	mux.HandleFunc("/detach", s.handleDetach)
-	mux.HandleFunc("/select", s.handleSelect)
-	mux.HandleFunc("/stream/set-slot", s.handleSetSlot)
-	mux.HandleFunc("/stream/clear-slot", s.handleClearSlot)
-	mux.HandleFunc("/slot/select", s.handleSelectSlot)
-	mux.HandleFunc("/cycle", s.handleCycle)
-	mux.HandleFunc("/monitor", s.handleMonitor)
-	mux.HandleFunc("/paste", s.handlePaste)
-	mux.HandleFunc("/redeem", s.handleRedeem)
-	mux.HandleFunc("/shutdown", s.handleShutdown)
-
-	srv := &http.Server{Handler: mux}
+	srv := &http.Server{Handler: s.handler()}
 	go func() {
 		<-ctx.Done()
 		_ = srv.Shutdown(context.Background())
@@ -94,6 +88,22 @@ func (s *Server) Serve(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func (s *Server) handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/attach", s.handleAttach)
+	mux.HandleFunc("/detach", s.handleDetach)
+	mux.HandleFunc("/select", s.handleSelect)
+	mux.HandleFunc("/stream/set-slot", s.handleSetSlot)
+	mux.HandleFunc("/stream/clear-slot", s.handleClearSlot)
+	mux.HandleFunc("/slot/select", s.handleSelectSlot)
+	mux.HandleFunc("/cycle", s.handleCycle)
+	mux.HandleFunc("/monitor", s.handleMonitor)
+	mux.HandleFunc("/paste", s.handlePaste)
+	mux.HandleFunc("/fix", s.handleFix)
+	mux.HandleFunc("/shutdown", s.handleShutdown)
+	return mux
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -239,9 +249,10 @@ func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
 
 func parseMonitorHistoryQuery(values url.Values) (persist.HistoryQuery, bool, error) {
 	rawLimit := values.Get("history_limit")
+	rawOffset := values.Get("history_offset")
 	rawSince := values.Get("history_since")
 	rawStream := values.Get("history_stream")
-	if rawLimit == "" && rawSince == "" && rawStream == "" {
+	if rawLimit == "" && rawOffset == "" && rawSince == "" && rawStream == "" {
 		return persist.HistoryQuery{}, false, nil
 	}
 
@@ -255,6 +266,13 @@ func parseMonitorHistoryQuery(values url.Values) (persist.HistoryQuery, bool, er
 			return persist.HistoryQuery{}, false, nil
 		}
 		query.Limit = limit
+	}
+	if rawOffset != "" {
+		offset, err := strconv.Atoi(rawOffset)
+		if err != nil || offset < 0 {
+			return persist.HistoryQuery{}, false, fmt.Errorf("history_offset must be zero or greater")
+		}
+		query.Offset = offset
 	}
 	if rawSince != "" {
 		since, err := time.Parse(time.RFC3339Nano, rawSince)
@@ -280,22 +298,23 @@ func (s *Server) monitorTranscripts(query persist.HistoryQuery, load bool) ([]Tr
 	out := make([]TranscriptEntry, 0, len(records))
 	for _, rec := range records {
 		out = append(out, TranscriptEntry{
-			Timestamp:    rec.Timestamp,
-			MessageID:    persist.RecordMessageID(rec),
-			AudioMs:      rec.AudioMs,
-			Stream:       rec.TargetStream,
-			OwnedStream:  rec.OwnedStream,
-			RedeemedFrom: rec.RedeemedFrom,
-			RedeemedTo:   rec.RedeemedTo,
-			CaptureID:    rec.CaptureID,
-			Stage:        rec.Stage,
-			TargetType:   rec.TargetType,
-			TargetRef:    rec.TargetRef,
-			Mode:         rec.Mode,
-			Success:      rec.Success,
-			Error:        rec.Error,
-			InferenceMs:  rec.InferenceMs,
-			Transcript:   rec.Transcript,
+			Timestamp:   rec.Timestamp,
+			MessageID:   persist.RecordMessageID(rec),
+			AudioMs:     rec.AudioMs,
+			Stream:      rec.TargetStream,
+			OwnedStream: rec.OwnedStream,
+			FixedFrom:   rec.FixedFrom,
+			FixedTo:     rec.FixedTo,
+			CaptureID:   rec.CaptureID,
+			Stage:       rec.Stage,
+			TargetType:  rec.TargetType,
+			TargetRef:   rec.TargetRef,
+			Mode:        rec.Mode,
+			Language:    rec.Language,
+			Success:     rec.Success,
+			Error:       rec.Error,
+			InferenceMs: rec.InferenceMs,
+			Transcript:  rec.Transcript,
 		})
 	}
 	return out, true, ""
@@ -307,20 +326,25 @@ func (s *Server) handlePaste(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	stream, err := s.reg.SendTextToActive(req.Text)
-	if err != nil {
+	stream := s.reg.ActiveStream()
+	if stream == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("no stream selected"))
+		return
+	}
+	label := serverStreamLabel(*stream)
+	if err := s.stageBuffer(label, *stream, req.Text); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, PasteResponse{Stream: stream, Chars: len(req.Text)})
+	writeJSON(w, http.StatusOK, PasteResponse{Stream: label, Chars: len(req.Text)})
 }
 
-func (s *Server) handleRedeem(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleFix(w http.ResponseWriter, r *http.Request) {
 	if s.transcriptsDir == "" {
 		writeErr(w, http.StatusServiceUnavailable, errors.New("transcript history unavailable"))
 		return
 	}
-	var req RedeemRequest
+	var req FixRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
@@ -341,27 +365,59 @@ func (s *Server) handleRedeem(w http.ResponseWriter, r *http.Request) {
 	if separator == "" {
 		separator = " "
 	}
-	selection, err := persist.SelectRedemptionMessages(s.transcriptsDir, req.From, req.Last, separator)
+	selection, err := persist.SelectFixMessages(s.transcriptsDir, req.From, req.Last, separator)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if _, err := s.reg.SendTextToStream(req.To, selection.Text); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	stream := s.reg.Stream(req.To)
+	if stream == nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("stream %q has no live target", req.To))
 		return
 	}
-	redemption, err := persist.SaveRedemption(s.transcriptsDir, req.From, req.To, selection.Messages, selection.Text)
+	fix, err := persist.SaveFix(s.transcriptsDir, req.From, req.To, selection.Messages, selection.Text)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, RedeemResponse{
+	if err := s.stageBuffer(serverStreamLabel(*stream), *stream, selection.Text); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, FixResponse{
 		From:       req.From,
 		To:         req.To,
-		MessageIDs: redemption.MessageIDs,
+		MessageIDs: fix.MessageIDs,
 		Chars:      len(selection.Text),
 		Text:       selection.Text,
 	})
+}
+
+func (s *Server) stageBuffer(label string, stream Stream, text string) error {
+	if s.bufferStore == nil {
+		return fmt.Errorf("transcript buffer unavailable")
+	}
+	_, err := s.bufferStore.Append(persist.BufferEntry{
+		Stream:       label,
+		TargetType:   stream.Target.TargetType,
+		TargetRef:    stream.Target.TargetRef,
+		Text:         text,
+		TranscriptAt: time.Now().UTC(),
+	})
+	return err
+}
+
+func serverStreamLabel(stream Stream) string {
+	if strings.TrimSpace(stream.Name) != "" {
+		return strings.TrimSpace(stream.Name)
+	}
+	if stream.Slot > 0 {
+		return fmt.Sprintf("slot %d", stream.Slot)
+	}
+	if stream.ID != "" {
+		return stream.ID
+	}
+	return "(unnamed)"
 }
 
 func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {

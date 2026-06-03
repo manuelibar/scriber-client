@@ -35,34 +35,6 @@ func TestSavePCM16WAV(t *testing.T) {
 	}
 }
 
-func TestLatestNonEmptyReturnsRecentRecordsInChronologicalOrder(t *testing.T) {
-	dir := t.TempDir()
-	base := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
-	records := []Record{
-		{Timestamp: base.Add(1 * time.Minute), Transcript: "one", Success: true},
-		{Timestamp: base.Add(2 * time.Minute), Transcript: "send failed", Success: false},
-		{Timestamp: base.Add(3 * time.Minute), Transcript: "   ", Success: true},
-		{Timestamp: base.Add(4 * time.Minute), Transcript: "two", Success: true},
-		{Timestamp: base.Add(5 * time.Minute), Transcript: "three", Success: true},
-	}
-	for _, rec := range records {
-		if err := writeRecord(dir, rec); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	got, err := LatestNonEmpty(dir, 3)
-	if err != nil {
-		t.Fatalf("LatestNonEmpty() error = %v", err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("len(got) = %d, want 3", len(got))
-	}
-	if got[0].Transcript != "send failed" || got[1].Transcript != "two" || got[2].Transcript != "three" {
-		t.Fatalf("transcripts = [%q, %q, %q], want [send failed, two, three]", got[0].Transcript, got[1].Transcript, got[2].Transcript)
-	}
-}
-
 func TestQueryHistoryFiltersByTimeStreamAndLimit(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
@@ -91,6 +63,68 @@ func TestQueryHistoryFiltersByTimeStreamAndLimit(t *testing.T) {
 	}
 	if got[0].Transcript != "second" || got[1].Transcript != "third" {
 		t.Fatalf("transcripts = [%q, %q], want [second, third]", got[0].Transcript, got[1].Transcript)
+	}
+}
+
+func TestQueryHistoryOffsetSkipsNewestMatchingRecords(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	for i, text := range []string{"one", "two", "three", "four"} {
+		if err := writeRecord(dir, Record{
+			Timestamp:  base.Add(time.Duration(i) * time.Minute),
+			Transcript: text,
+			Success:    true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := QueryHistory(dir, HistoryQuery{Limit: 2, Offset: 1})
+	if err != nil {
+		t.Fatalf("QueryHistory() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+	if got[0].Transcript != "two" || got[1].Transcript != "three" {
+		t.Fatalf("transcripts = [%q, %q], want [two, three]", got[0].Transcript, got[1].Transcript)
+	}
+
+	got, err = QueryHistory(dir, HistoryQuery{Limit: 2, Offset: 4})
+	if err != nil {
+		t.Fatalf("QueryHistory(offset beyond end) error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("len(got) = %d, want 0", len(got))
+	}
+}
+
+func TestQueryOwnedHistoryOffsetUsesOwnedStreams(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	records := []Record{
+		{Timestamp: base, MessageID: "m1", TargetStream: "notes", Transcript: "one", Success: true},
+		{Timestamp: base.Add(time.Minute), MessageID: "m2", TargetStream: "notes", Transcript: "two", Success: true},
+		{Timestamp: base.Add(2 * time.Minute), MessageID: "m3", TargetStream: "codex", Transcript: "three", Success: true},
+	}
+	for _, rec := range records {
+		if err := writeRecord(dir, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := SaveFix(dir, "notes", "codex", records[1:2], "two"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := QueryOwnedHistory(dir, HistoryQuery{Stream: "codex", Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatalf("QueryOwnedHistory() error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want 1", len(got))
+	}
+	if got[0].Transcript != "two" || got[0].OwnedStream != "codex" || got[0].FixedFrom != "notes" {
+		t.Fatalf("owned record = %+v, want fixed notes message under codex", got[0])
 	}
 }
 

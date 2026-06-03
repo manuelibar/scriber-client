@@ -79,6 +79,11 @@ func (r *Registry) normalizeLocked() {
 	for i := range r.state.Streams {
 		s := &r.state.Streams[i]
 		s.Name = strings.TrimSpace(s.Name)
+		if language, err := ipc.NormalizeLanguage(s.Language); err == nil {
+			s.Language = language
+		} else {
+			s.Language = ""
+		}
 		if s.Name != "" && seenNames[s.Name] {
 			s.Name = uniqueName(s.Name, seenNames)
 		}
@@ -147,6 +152,10 @@ func (r *Registry) saveLocked() error {
 
 func (r *Registry) Attach(req *ipc.AttachRequest) (*ipc.Stream, string, error) {
 	name := strings.TrimSpace(req.StreamName)
+	language, err := ipc.NormalizeLanguage(req.Language)
+	if err != nil {
+		return nil, "", err
+	}
 	if req.TargetType == "" {
 		req.TargetType = ipc.TargetTypePTY
 	}
@@ -181,6 +190,7 @@ func (r *Registry) Attach(req *ipc.AttachRequest) (*ipc.Stream, string, error) {
 		stream.AttachedAt = now
 	}
 	stream.Name = name
+	stream.Language = language
 	stream.Status = ipc.StreamStatusActive
 	stream.LastUsedAt = now
 	if stream.Slot == 0 {
@@ -406,31 +416,6 @@ func (r *Registry) Stream(name string) *ipc.Stream {
 	}
 	cp := r.state.Streams[idx]
 	return &cp
-}
-
-func (r *Registry) SendTextToActive(text string) (string, error) {
-	if text == "" {
-		return "", fmt.Errorf("text is empty")
-	}
-	stream := r.ActiveStream()
-	if stream == nil {
-		return "", fmt.Errorf("no stream selected")
-	}
-	if err := SendText(stream.Target, text); err != nil {
-		_ = r.PruneDead()
-		return streamLabel(*stream), err
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	idx := r.findStreamByIDLocked(stream.ID)
-	if idx >= 0 {
-		r.state.Streams[idx].LastUsedAt = time.Now().UTC()
-		if err := r.saveLocked(); err != nil {
-			return streamLabel(*stream), err
-		}
-	}
-	return streamLabel(*stream), nil
 }
 
 func (r *Registry) SendTextToStream(name, text string) (string, error) {

@@ -22,7 +22,7 @@ import (
 	"scriber/internal/ipc"
 )
 
-func runAttachedTerminal(ctx context.Context, streamName string, command []string) error {
+func runAttachedTerminal(ctx context.Context, streamName, language string, command []string) error {
 	if !isTerminal(int(os.Stdin.Fd())) || !isTerminal(int(os.Stdout.Fd())) {
 		return fmt.Errorf("stt attach must run from an interactive terminal")
 	}
@@ -46,6 +46,9 @@ func runAttachedTerminal(ctx context.Context, streamName string, command []strin
 	cmd.Env = os.Environ()
 	if streamName != "" {
 		cmd.Env = append(cmd.Env, "STT_STREAM="+streamName)
+	}
+	if language != "" {
+		cmd.Env = append(cmd.Env, "STT_LANGUAGE="+language)
 	}
 
 	ptmx, err := pty.Start(cmd)
@@ -72,6 +75,7 @@ func runAttachedTerminal(ctx context.Context, streamName string, command []strin
 		CWD:        cwd,
 		Term:       os.Getenv("TERM"),
 		StreamName: streamName,
+		Language:   language,
 		TargetType: ipc.TargetTypePTY,
 		TargetRef:  socketPath,
 		Label:      streamName,
@@ -80,7 +84,11 @@ func runAttachedTerminal(ctx context.Context, streamName string, command []strin
 		_ = cmd.Process.Kill()
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "stt attached stream %q. Exit this shell to detach.\n", resp.Stream.Name)
+	if resp.Stream.Language != "" {
+		fmt.Fprintf(os.Stderr, "stt attached stream %q language=%s. Exit this shell to detach.\n", resp.Stream.Name, resp.Stream.Language)
+	} else {
+		fmt.Fprintf(os.Stderr, "stt attached stream %q. Exit this shell to detach.\n", resp.Stream.Name)
+	}
 
 	restore, err := makeRaw(int(os.Stdin.Fd()))
 	if err != nil {

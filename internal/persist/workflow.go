@@ -15,6 +15,11 @@ import (
 )
 
 const (
+	CaptureKindDictation = "dictation"
+	CaptureKindCommand   = "command"
+)
+
+const (
 	StageRecording         = "Recording"
 	StageStoppingCapture   = "StoppingCapture"
 	StageSavingAudio       = "SavingAudio"
@@ -24,7 +29,11 @@ const (
 	StageTranscribed       = "Transcribed"
 	StageQueuedForDelivery = "QueuedForDelivery"
 	StageDelivering        = "Delivering"
-	StageDelivered         = "Delivered"
+	StageBuffered          = "Buffered"
+	StageBufferFinalized   = "BufferFinalized"
+	StageQueuedForCommand  = "QueuedForCommand"
+	StageApplyingCommand   = "ApplyingCommand"
+	StageCommandApplied    = "CommandApplied"
 	StageFailed            = "Failed"
 )
 
@@ -37,6 +46,7 @@ const (
 
 type CaptureMeta struct {
 	CaptureID       string    `json:"capture_id"`
+	Kind            string    `json:"kind,omitempty"`
 	Stage           string    `json:"stage"`
 	CreatedAt       time.Time `json:"created_at"`
 	UpdatedAt       time.Time `json:"updated_at"`
@@ -52,7 +62,7 @@ type CaptureMeta struct {
 	TargetStream    string    `json:"target_stream,omitempty"`
 	TargetType      string    `json:"target_type,omitempty"`
 	TargetRef       string    `json:"target_ref,omitempty"`
-	DeliveredAt     time.Time `json:"delivered_at,omitempty"`
+	Language        string    `json:"language,omitempty"`
 	FailedStage     string    `json:"failed_stage,omitempty"`
 	Error           string    `json:"error,omitempty"`
 	Retryable       bool      `json:"retryable,omitempty"`
@@ -74,7 +84,16 @@ type CaptureWriter struct {
 type RecoveryPlan struct {
 	ASR      []CaptureMeta
 	Delivery []CaptureMeta
+	Command  []CaptureMeta
 	Failed   []CaptureMeta
+}
+
+type CaptureOptions struct {
+	Kind         string
+	TargetStream string
+	TargetType   string
+	TargetRef    string
+	Language     string
 }
 
 func NewCaptureStore(transcriptsDir string) *CaptureStore {
@@ -82,6 +101,10 @@ func NewCaptureStore(transcriptsDir string) *CaptureStore {
 }
 
 func (s *CaptureStore) NewCapture(sampleRate int) (*CaptureWriter, error) {
+	return s.NewCaptureWithOptions(sampleRate, CaptureOptions{})
+}
+
+func (s *CaptureStore) NewCaptureWithOptions(sampleRate int, opts CaptureOptions) (*CaptureWriter, error) {
 	if s == nil || strings.TrimSpace(s.Root) == "" {
 		return nil, fmt.Errorf("capture store root is empty")
 	}
@@ -106,12 +129,26 @@ func (s *CaptureStore) NewCapture(sampleRate int) (*CaptureWriter, error) {
 		UpdatedAt:       now,
 		SampleRate:      sampleRate,
 		InflightPCMPath: inflight,
+		Kind:            normalizeCaptureKind(opts.Kind),
+		TargetStream:    strings.TrimSpace(opts.TargetStream),
+		TargetType:      strings.TrimSpace(opts.TargetType),
+		TargetRef:       strings.TrimSpace(opts.TargetRef),
+		Language:        strings.TrimSpace(opts.Language),
 	}
 	if err := s.writeMeta(meta); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
 	return &CaptureWriter{store: s, meta: meta, file: f}, nil
+}
+
+func normalizeCaptureKind(kind string) string {
+	switch strings.TrimSpace(kind) {
+	case CaptureKindCommand:
+		return CaptureKindCommand
+	default:
+		return CaptureKindDictation
+	}
 }
 
 func (w *CaptureWriter) CaptureID() string {
@@ -343,7 +380,42 @@ func (s *CaptureStore) Recover(minPCMBytes int64) (RecoveryPlan, error) {
 				return RecoveryPlan{}, err
 			}
 			plan.ASR = append(plan.ASR, queued)
-		case StageTranscribed, StageQueuedForDelivery, StageDelivering:
+		case StageTranscribed:
+			if meta.Kind == CaptureKindCommand {
+				queued, err := s.Update(meta.CaptureID, func(next *CaptureMeta) {
+					next.Stage = StageQueuedForCommand
+					next.Error = ""
+					next.FailedStage = ""
+					next.Retryable = false
+				})
+				if err != nil {
+					return RecoveryPlan{}, err
+				}
+				plan.Command = append(plan.Command, queued)
+				continue
+			}
+			queued, err := s.Update(meta.CaptureID, func(next *CaptureMeta) {
+				next.Stage = StageQueuedForDelivery
+				next.Error = ""
+				next.FailedStage = ""
+				next.Retryable = false
+			})
+			if err != nil {
+				return RecoveryPlan{}, err
+			}
+			plan.Delivery = append(plan.Delivery, queued)
+		case StageQueuedForCommand, StageApplyingCommand:
+			queued, err := s.Update(meta.CaptureID, func(next *CaptureMeta) {
+				next.Stage = StageQueuedForCommand
+				next.Error = ""
+				next.FailedStage = ""
+				next.Retryable = false
+			})
+			if err != nil {
+				return RecoveryPlan{}, err
+			}
+			plan.Command = append(plan.Command, queued)
+		case StageQueuedForDelivery, StageDelivering:
 			queued, err := s.Update(meta.CaptureID, func(next *CaptureMeta) {
 				next.Stage = StageQueuedForDelivery
 				next.Error = ""

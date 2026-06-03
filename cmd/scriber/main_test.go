@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 	"time"
 
 	"scriber/internal/ipc"
+	"scriber/internal/persist"
 )
 
 func TestRootCommandUsesSTTNaming(t *testing.T) {
@@ -24,7 +26,7 @@ func TestRootCommandHasStreamCommands(t *testing.T) {
 	for _, cmd := range root.Commands() {
 		commands[cmd.Name()] = true
 	}
-	for _, want := range []string{"start", "shutdown", "attach", "stream", "select", "cycle", "paste", "redeem", "history", "monitor", "doctor"} {
+	for _, want := range []string{"start", "shutdown", "attach", "stream", "select", "cycle", "paste", "fix", "history", "monitor", "doctor"} {
 		if !commands[want] {
 			t.Fatalf("root command missing %q; got %v", want, commands)
 		}
@@ -40,6 +42,9 @@ func TestAttachAndSelectUsage(t *testing.T) {
 	attach := attachCmd()
 	if attach.Use != "attach [NAME] [-- COMMAND...]" {
 		t.Fatalf("attach Use = %q, want attach [NAME] [-- COMMAND...]", attach.Use)
+	}
+	if attach.Flags().Lookup("language") == nil {
+		t.Fatalf("attach command missing language flag")
 	}
 	detach := detachCmd()
 	if detach.Use != "detach [NAME|SLOT|all]" {
@@ -118,15 +123,18 @@ func TestPasteUsage(t *testing.T) {
 	}
 }
 
-func TestRedeemUsage(t *testing.T) {
-	redeem := redeemCmd()
-	if redeem.Use != "redeem --to DEST --last N [--from SOURCE]" {
-		t.Fatalf("redeem Use = %q, want redeem --to DEST --last N [--from SOURCE]", redeem.Use)
+func TestFixUsage(t *testing.T) {
+	fix := fixCmd()
+	if fix.Use != "fix --to DEST --last N [--from SOURCE]" {
+		t.Fatalf("fix Use = %q, want fix --to DEST --last N [--from SOURCE]", fix.Use)
 	}
 	for _, flag := range []string{"from", "to", "last", "separator"} {
-		if redeem.Flags().Lookup(flag) == nil {
-			t.Fatalf("redeem command missing %q flag", flag)
+		if fix.Flags().Lookup(flag) == nil {
+			t.Fatalf("fix command missing %q flag", flag)
 		}
+	}
+	if len(fix.Aliases) != 0 {
+		t.Fatalf("fix aliases = %v, want none", fix.Aliases)
 	}
 }
 
@@ -136,11 +144,52 @@ func TestHistoryPruneUsage(t *testing.T) {
 	for _, cmd := range history.Commands() {
 		commands[cmd.Name()] = true
 	}
-	if !commands["prune"] {
-		t.Fatalf("history command missing prune subcommand; got %v", commands)
+	if !commands["ls"] || !commands["prune"] {
+		t.Fatalf("history command missing ls/prune subcommands; got %v", commands)
 	}
 	if got, err := parseHistoryDuration("2d"); err != nil || got != 48*time.Hour {
 		t.Fatalf("parseHistoryDuration(2d) = %v %v, want 48h nil", got, err)
+	}
+}
+
+func TestHistoryListCommandUsesOwnedHistoryAndOffset(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 5, 23, 12, 0, 0, 0, time.UTC)
+	records := []persist.Record{
+		{Timestamp: base, MessageID: "m1", TargetStream: "notes", Transcript: "one", Success: true},
+		{Timestamp: base.Add(time.Minute), MessageID: "m2", TargetStream: "notes", Transcript: "two", Success: true},
+		{Timestamp: base.Add(2 * time.Minute), MessageID: "m3", TargetStream: "codex", Transcript: "three", Success: true},
+	}
+	for _, rec := range records {
+		if err := persist.Save(dir, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := persist.SaveFix(dir, "notes", "codex", records[1:2], "two"); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := historyListCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"codex", "--transcripts-dir", dir, "--limit", "1", "--offset", "1"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("history ls error = %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		`history: 1 message(s) for stream "codex" offset=1 limit=1`,
+		"stream=codex original=notes",
+		"id=m2",
+		"fixed: notes -> codex",
+		"two",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("history ls output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "three") {
+		t.Fatalf("history ls offset should skip newest codex message:\n%s", got)
 	}
 }
 
@@ -295,11 +344,11 @@ func TestRenderMonitorSnapshotIncludesDaemonAndStreams(t *testing.T) {
 		"  slot=3  name=-",
 		"session history:",
 		"slot=1 name=kb",
-		"--- 03:04:05 ok | ~2 tokens | talk=0.0s ---",
+		"--- 03:04:05 ok | ~2 tokens | talk=0.0s | lang=- ---",
 		"  hello",
 		"  world",
 		"unmatched stream",
-		"--- 03:04:06 failed | ~1 tokens | talk=0.0s ---",
+		"--- 03:04:06 failed | ~1 tokens | talk=0.0s | lang=- ---",
 		"error: send failed",
 	} {
 		if !strings.Contains(got, want) {

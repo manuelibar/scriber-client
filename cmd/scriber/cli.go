@@ -19,6 +19,7 @@ import (
 )
 
 func attachCmd() *cobra.Command {
+	var language string
 	c := &cobra.Command{
 		Use:   "attach [NAME] [-- COMMAND...]",
 		Short: "Start an STT-managed terminal stream and select it",
@@ -31,9 +32,14 @@ func attachCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runAttachedTerminal(cmd.Context(), streamName, command)
+			normalizedLanguage, err := ipc.NormalizeLanguage(language)
+			if err != nil {
+				return err
+			}
+			return runAttachedTerminal(cmd.Context(), streamName, normalizedLanguage, command)
 		},
 	}
+	c.Flags().StringVar(&language, "language", "", "stream transcription language: auto, en, es, or a locale like es-ES")
 	return c
 }
 
@@ -163,7 +169,7 @@ func streamIsActive(s ipc.Stream, active string, activeSlot int) bool {
 func selectCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "select NAME",
-		Short: "Select the one stream that receives final dictated text",
+		Short: "Select the one stream that receives staged dictated text",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cli := ipc.NewClient(config.SocketPath())
@@ -198,7 +204,7 @@ func pasteCmd() *cobra.Command {
 	var separator string
 	c := &cobra.Command{
 		Use:   "paste [N]",
-		Short: "Paste recent transcript text into the selected stream",
+		Short: "Stage recent transcript text in the selected stream buffer",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			count := 1
@@ -219,7 +225,7 @@ func pasteCmd() *cobra.Command {
 				dir = config.ExpandPath(transcriptsDir)
 			}
 
-			records, err := persist.LatestNonEmpty(dir, count)
+			records, err := persist.QueryOwnedHistory(dir, persist.HistoryQuery{Limit: count})
 			if err != nil {
 				return err
 			}
@@ -240,7 +246,7 @@ func pasteCmd() *cobra.Command {
 			if len(records) != 1 {
 				label = "transcripts"
 			}
-			fmt.Printf("pasted %d %s to stream %q\n", len(records), label, resp.Stream)
+			fmt.Printf("staged %d %s in stream %q\n", len(records), label, resp.Stream)
 			return nil
 		},
 	}
@@ -249,14 +255,14 @@ func pasteCmd() *cobra.Command {
 	return c
 }
 
-func redeemCmd() *cobra.Command {
+func fixCmd() *cobra.Command {
 	var from string
 	var to string
 	var last int
 	var separator string
 	c := &cobra.Command{
-		Use:   "redeem --to DEST --last N [--from SOURCE]",
-		Short: "Move recent transcript ownership to another stream and paste it there",
+		Use:   "fix --to DEST --last N [--from SOURCE]",
+		Short: "Fix recent transcript ownership and stage it in another stream",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if to == "" {
@@ -280,7 +286,7 @@ func redeemCmd() *cobra.Command {
 				}
 				fmt.Fprintf(cmd.OutOrStdout(), "source stream defaulted to active stream %q\n", from)
 			}
-			resp, err := cli.Redeem(ipc.RedeemRequest{
+			resp, err := cli.Fix(ipc.FixRequest{
 				From:      from,
 				To:        to,
 				Last:      last,
@@ -289,13 +295,13 @@ func redeemCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "redeemed %d message(s) from %q to %q and pasted %d chars\n", len(resp.MessageIDs), resp.From, resp.To, resp.Chars)
+			fmt.Fprintf(cmd.OutOrStdout(), "fixed %d message(s) from %q to %q and staged %d chars\n", len(resp.MessageIDs), resp.From, resp.To, resp.Chars)
 			return nil
 		},
 	}
 	c.Flags().StringVar(&from, "from", "", "source stream; defaults visibly to the active stream")
 	c.Flags().StringVar(&to, "to", "", "destination stream")
-	c.Flags().IntVar(&last, "last", 1, "number of latest delivered messages to redeem")
+	c.Flags().IntVar(&last, "last", 1, "number of latest delivered messages to fix")
 	c.Flags().StringVar(&separator, "separator", " ", "text inserted between messages; supports \\n, \\r, and \\t escapes")
 	return c
 }
@@ -313,7 +319,7 @@ func monitorCmd() *cobra.Command {
 	var historyStream string
 	c := &cobra.Command{
 		Use:   "monitor",
-		Short: "Show daemon state, streams, selected target, session history, and audio level",
+		Short: "Show daemon dashboard, streams, selected target, and audio level",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if interval <= 0 {
 				return fmt.Errorf("interval must be positive")
@@ -363,7 +369,7 @@ func monitorCmd() *cobra.Command {
 				history.Add(monitor.Transcripts)
 				monitor.Transcripts = history.Entries()
 				monitor.TranscriptHistoryLoaded = history.limit > 0
-				fmt.Print("\033[H\033[2J")
+				fmt.Print("\033[H\033[J")
 				fmt.Print(renderMonitorSnapshotWithOptions(monitor, true, monitorRenderOptions{
 					SessionStart: sessionStart,
 					Now:          time.Now(),
@@ -382,7 +388,7 @@ func monitorCmd() *cobra.Command {
 	c.Flags().DurationVar(&interval, "interval", 250*time.Millisecond, "refresh interval")
 	c.Flags().BoolVar(&once, "once", false, "print one combined snapshot and exit")
 	c.Flags().BoolVar(&porcelain, "porcelain", false, "print one stable machine-readable snapshot and exit")
-	c.Flags().IntVar(&historyLimit, "history-limit", 200, "session transcript ring size; 0 hides monitor-session history")
+	c.Flags().IntVar(&historyLimit, "history-limit", 0, "session transcript ring size; 0 keeps the live monitor dashboard-only")
 	c.Flags().StringVar(&historyStream, "history-stream", "", "only show monitor-session history for a specific stream name")
 	return c
 }
@@ -485,7 +491,7 @@ func renderMonitorPorcelain(monitor *ipc.MonitorResponse) string {
 	}
 	for i, stream := range monitor.Streams {
 		streamStats := stats.ByStream[streamKey(stream)]
-		fmt.Fprintf(&b, "stream index=%d active=%t id=%s slot=%d name=%s status=%s target_type=%s target_ref=%s target_label=%s target_tty=%s target_cwd=%s target_pid=%d attached_at=%s last_used_at=%s target_attached_at=%s target_last_seen_at=%s transcript_count=%d transcript_tokens=%d transcript_audio_ms=%d\n",
+		fmt.Fprintf(&b, "stream index=%d active=%t id=%s slot=%d name=%s status=%s target_type=%s target_ref=%s target_label=%s target_tty=%s target_cwd=%s target_pid=%d attached_at=%s last_used_at=%s target_attached_at=%s target_last_seen_at=%s transcript_count=%d transcript_tokens=%d transcript_audio_ms=%d language=%s\n",
 			i,
 			streamIsActive(stream, monitor.Active, monitor.ActiveSlot),
 			porcelainQuote(stream.ID),
@@ -505,10 +511,11 @@ func renderMonitorPorcelain(monitor *ipc.MonitorResponse) string {
 			streamStats.Entries,
 			streamStats.Tokens,
 			streamStats.AudioMs,
+			porcelainQuote(stream.Language),
 		)
 	}
 	for i, job := range monitor.Jobs {
-		fmt.Fprintf(&b, "job index=%d capture_id=%s stage=%s age_ms=%d updated_ago_ms=%d audio_path=%s target_stream=%s target_type=%s target_ref=%s retryable=%t error=%s\n",
+		fmt.Fprintf(&b, "job index=%d capture_id=%s stage=%s age_ms=%d updated_ago_ms=%d audio_path=%s target_stream=%s target_type=%s target_ref=%s retryable=%t error=%s language=%s\n",
 			i,
 			porcelainQuote(job.CaptureID),
 			porcelainQuote(job.Stage),
@@ -520,10 +527,11 @@ func renderMonitorPorcelain(monitor *ipc.MonitorResponse) string {
 			porcelainQuote(job.TargetRef),
 			job.Retryable,
 			porcelainQuote(job.Error),
+			porcelainQuote(job.Language),
 		)
 	}
 	for i, entry := range monitor.Transcripts {
-		fmt.Fprintf(&b, "transcript index=%d ts=%s stream=%s target_type=%s target_ref=%s mode=%s success=%t audio_ms=%d inference_ms=%d tokens=%d error=%s text=%s message_id=%s owned_stream=%s capture_id=%s stage=%s redeemed_from=%s redeemed_to=%s\n",
+		fmt.Fprintf(&b, "transcript index=%d ts=%s stream=%s target_type=%s target_ref=%s mode=%s success=%t audio_ms=%d inference_ms=%d tokens=%d error=%s text=%s message_id=%s owned_stream=%s capture_id=%s stage=%s fixed_from=%s fixed_to=%s language=%s\n",
 			i,
 			porcelainTime(entry.Timestamp),
 			porcelainQuote(entry.Stream),
@@ -540,8 +548,9 @@ func renderMonitorPorcelain(monitor *ipc.MonitorResponse) string {
 			porcelainQuote(entry.OwnedStream),
 			porcelainQuote(entry.CaptureID),
 			porcelainQuote(entry.Stage),
-			porcelainQuote(entry.RedeemedFrom),
-			porcelainQuote(entry.RedeemedTo),
+			porcelainQuote(entry.FixedFrom),
+			porcelainQuote(entry.FixedTo),
+			porcelainQuote(entry.Language),
 		)
 	}
 	return b.String()
@@ -775,8 +784,12 @@ func formatTranscriptEntry(entry ipc.TranscriptEntry, indent string, color bool)
 	if !entry.Timestamp.IsZero() {
 		when = entry.Timestamp.Local().Format("15:04:05")
 	}
-	separator := fmt.Sprintf("%s--- %s %s | ~%d tokens | talk=%s ---\n",
-		indent, when, status, estimateTokens(entry.Transcript), formatDurationShort(time.Duration(entry.AudioMs)*time.Millisecond))
+	language := entry.Language
+	if language == "" {
+		language = "-"
+	}
+	separator := fmt.Sprintf("%s--- %s %s | ~%d tokens | talk=%s | lang=%s ---\n",
+		indent, when, status, estimateTokens(entry.Transcript), formatDurationShort(time.Duration(entry.AudioMs)*time.Millisecond), language)
 	if color {
 		color := "2"
 		if status == "failed" {
@@ -796,8 +809,8 @@ func formatTranscriptEntry(entry ipc.TranscriptEntry, indent string, color bool)
 	if entry.Error != "" {
 		fmt.Fprintf(&b, "%serror: %s\n", indent, entry.Error)
 	}
-	if entry.RedeemedFrom != "" && entry.RedeemedTo != "" {
-		fmt.Fprintf(&b, "%sredeemed: %s -> %s\n", indent, entry.RedeemedFrom, entry.RedeemedTo)
+	if entry.FixedFrom != "" && entry.FixedTo != "" {
+		fmt.Fprintf(&b, "%sfixed: %s -> %s\n", indent, entry.FixedFrom, entry.FixedTo)
 	}
 	return b.String()
 }
@@ -901,8 +914,12 @@ func formatMonitorStream(stream ipc.Stream, active string, activeSlot int, now t
 	if !stream.AttachedAt.IsZero() {
 		up = formatDurationShort(now.Sub(stream.AttachedAt))
 	}
-	return fmt.Sprintf("%s slot=%-2s name=%-20s status=%-8s target=%s pid=%s attached=%s up=%s msgs=%d tokens~%d talk=%s\n",
-		marker, slot, name, stream.Status, target, pid, attached, up, stats.Entries, stats.Tokens, formatDurationShort(time.Duration(stats.AudioMs)*time.Millisecond))
+	language := stream.Language
+	if language == "" {
+		language = "-"
+	}
+	return fmt.Sprintf("%s slot=%-2s name=%-20s status=%-8s target=%s pid=%s attached=%s up=%s msgs=%d tokens~%d talk=%s lang=%s\n",
+		marker, slot, name, stream.Status, target, pid, attached, up, stats.Entries, stats.Tokens, formatDurationShort(time.Duration(stats.AudioMs)*time.Millisecond), language)
 }
 
 func compactMonitorText(text string, limit int) string {

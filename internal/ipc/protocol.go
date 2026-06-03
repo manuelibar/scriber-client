@@ -12,8 +12,8 @@ const (
 
 // Target is the concrete STT-owned endpoint attached to a logical stream.
 // For the terminal backend, TargetRef is a private Unix socket served by
-// `stt attach`; the daemon POSTs final text there and the attach process writes
-// it into the PTY master it owns.
+// `stt attach`; checkpoint streaming and finalized-buffer paste POST text
+// there, and the attach process writes it into the PTY master it owns.
 type Target struct {
 	ID         string    `json:"id"`
 	StreamID   string    `json:"stream_id"`
@@ -27,10 +27,11 @@ type Target struct {
 	LastSeenAt time.Time `json:"last_seen_at"`
 }
 
-// Stream is the user-facing destination for dictated final text.
+// Stream is the user-facing destination for checkpoint and finalized text.
 type Stream struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name,omitempty"`
+	Language   string    `json:"language,omitempty"`
 	Slot       int       `json:"slot,omitempty"`
 	Target     Target    `json:"target"`
 	Status     string    `json:"status"`
@@ -45,6 +46,7 @@ type AttachRequest struct {
 	CWD        string `json:"cwd"`
 	Term       string `json:"term"`
 	StreamName string `json:"stream_name,omitempty"`
+	Language   string `json:"language,omitempty"`
 	TargetType string `json:"target_type"`
 	TargetRef  string `json:"target_ref"`
 	Label      string `json:"label,omitempty"`
@@ -91,22 +93,23 @@ type CycleResponse struct {
 }
 
 type TranscriptEntry struct {
-	Timestamp    time.Time `json:"ts"`
-	MessageID    string    `json:"message_id,omitempty"`
-	AudioMs      int       `json:"audio_ms,omitempty"`
-	Stream       string    `json:"stream,omitempty"`
-	OwnedStream  string    `json:"owned_stream,omitempty"`
-	RedeemedFrom string    `json:"redeemed_from,omitempty"`
-	RedeemedTo   string    `json:"redeemed_to,omitempty"`
-	CaptureID    string    `json:"capture_id,omitempty"`
-	Stage        string    `json:"stage,omitempty"`
-	TargetType   string    `json:"target_type,omitempty"`
-	TargetRef    string    `json:"target_ref,omitempty"`
-	Mode         string    `json:"mode,omitempty"`
-	Success      bool      `json:"success"`
-	Error        string    `json:"error,omitempty"`
-	InferenceMs  int       `json:"inference_ms,omitempty"`
-	Transcript   string    `json:"transcript"`
+	Timestamp   time.Time `json:"ts"`
+	MessageID   string    `json:"message_id,omitempty"`
+	AudioMs     int       `json:"audio_ms,omitempty"`
+	Stream      string    `json:"stream,omitempty"`
+	OwnedStream string    `json:"owned_stream,omitempty"`
+	FixedFrom   string    `json:"fixed_from,omitempty"`
+	FixedTo     string    `json:"fixed_to,omitempty"`
+	CaptureID   string    `json:"capture_id,omitempty"`
+	Stage       string    `json:"stage,omitempty"`
+	TargetType  string    `json:"target_type,omitempty"`
+	TargetRef   string    `json:"target_ref,omitempty"`
+	Mode        string    `json:"mode,omitempty"`
+	Language    string    `json:"language,omitempty"`
+	Success     bool      `json:"success"`
+	Error       string    `json:"error,omitempty"`
+	InferenceMs int       `json:"inference_ms,omitempty"`
+	Transcript  string    `json:"transcript"`
 }
 
 type JobSnapshot struct {
@@ -120,6 +123,7 @@ type JobSnapshot struct {
 	TargetStream string    `json:"target_stream,omitempty"`
 	TargetType   string    `json:"target_type,omitempty"`
 	TargetRef    string    `json:"target_ref,omitempty"`
+	Language     string    `json:"language,omitempty"`
 	Error        string    `json:"error,omitempty"`
 	Retryable    bool      `json:"retryable,omitempty"`
 }
@@ -154,14 +158,14 @@ type PasteResponse struct {
 	Chars  int    `json:"chars"`
 }
 
-type RedeemRequest struct {
+type FixRequest struct {
 	From      string `json:"from"`
 	To        string `json:"to"`
 	Last      int    `json:"last"`
 	Separator string `json:"separator,omitempty"`
 }
 
-type RedeemResponse struct {
+type FixResponse struct {
 	From       string   `json:"from"`
 	To         string   `json:"to"`
 	MessageIDs []string `json:"message_ids"`

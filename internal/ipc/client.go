@@ -124,6 +124,7 @@ type MonitorQuery struct {
 	HistorySince  time.Time
 	HistoryStream string
 	HistoryLimit  int
+	HistoryOffset int
 }
 
 func (c *Client) Monitor(queries ...MonitorQuery) (*MonitorResponse, error) {
@@ -140,6 +141,9 @@ func (c *Client) Monitor(queries ...MonitorQuery) (*MonitorResponse, error) {
 		}
 		if query.HistoryLimit != 0 {
 			values.Set("history_limit", strconv.Itoa(query.HistoryLimit))
+		}
+		if query.HistoryOffset != 0 {
+			values.Set("history_offset", strconv.Itoa(query.HistoryOffset))
 		}
 		if encoded := values.Encode(); encoded != "" {
 			path += "?" + encoded
@@ -159,9 +163,9 @@ func (c *Client) Paste(text string) (*PasteResponse, error) {
 	return &out, nil
 }
 
-func (c *Client) Redeem(req RedeemRequest) (*RedeemResponse, error) {
-	var out RedeemResponse
-	if err := c.post("/redeem", req, &out); err != nil {
+func (c *Client) Fix(req FixRequest) (*FixResponse, error) {
+	var out FixResponse
+	if err := c.post("/fix", req, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

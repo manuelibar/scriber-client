@@ -19,8 +19,179 @@ func historyCmd() *cobra.Command {
 		Use:   "history",
 		Short: "Manage transcript history",
 	}
-	c.AddCommand(historyPruneCmd())
+	c.AddCommand(historyListCmd(), historyPruneCmd())
 	return c
+}
+
+type historyListOptions struct {
+	Stream    string
+	Limit     int
+	Offset    int
+	Porcelain bool
+}
+
+func historyListCmd() *cobra.Command {
+	var transcriptsDir string
+	var streamFlag string
+	var limit int
+	var offset int
+	var porcelain bool
+
+	c := &cobra.Command{
+		Use:     "ls [STREAM]",
+		Aliases: []string{"list"},
+		Short:   "List recent persisted transcript messages",
+		Args:    cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if limit <= 0 {
+				return fmt.Errorf("--limit must be positive")
+			}
+			if offset < 0 {
+				return fmt.Errorf("--offset must be zero or greater")
+			}
+			stream := strings.TrimSpace(streamFlag)
+			if len(args) == 1 {
+				if stream != "" {
+					return fmt.Errorf("STREAM argument and --stream are mutually exclusive")
+				}
+				stream = strings.TrimSpace(args[0])
+			}
+
+			cfg, err := config.LoadDefault()
+			if err != nil {
+				return err
+			}
+			dir := cfg.Storage.TranscriptsDir
+			if transcriptsDir != "" {
+				dir = config.ExpandPath(transcriptsDir)
+			}
+
+			records, err := persist.QueryOwnedHistory(dir, persist.HistoryQuery{
+				Stream: stream,
+				Limit:  limit,
+				Offset: offset,
+			})
+			if err != nil {
+				return err
+			}
+			printHistoryList(cmd.OutOrStdout(), records, historyListOptions{
+				Stream:    stream,
+				Limit:     limit,
+				Offset:    offset,
+				Porcelain: porcelain,
+			})
+			return nil
+		},
+	}
+	c.Flags().StringVar(&transcriptsDir, "transcripts-dir", "", "directory to read transcript JSON files from")
+	c.Flags().StringVar(&streamFlag, "stream", "", "only show messages currently owned by this stream")
+	c.Flags().IntVar(&limit, "limit", 20, "maximum number of messages to show")
+	c.Flags().IntVar(&offset, "offset", 0, "skip this many newest matching messages before listing")
+	c.Flags().BoolVar(&porcelain, "porcelain", false, "print stable machine-readable output")
+	return c
+}
+
+func printHistoryList(w io.Writer, records []persist.Record, opts historyListOptions) {
+	if opts.Porcelain {
+		printHistoryListPorcelain(w, records, opts)
+		return
+	}
+	if len(records) == 0 {
+		fmt.Fprintf(w, "history: no transcript messages found%s\n", historyListStreamSuffix(opts.Stream))
+		return
+	}
+	fmt.Fprintf(w, "history: %d message(s)%s offset=%d limit=%d (newest last)\n", len(records), historyListStreamSuffix(opts.Stream), opts.Offset, opts.Limit)
+	for i, rec := range records {
+		printHistoryRecord(w, i, rec)
+	}
+}
+
+func printHistoryRecord(w io.Writer, index int, rec persist.Record) {
+	when := "-"
+	if !rec.Timestamp.IsZero() {
+		when = rec.Timestamp.Local().Format("2006-01-02 15:04:05")
+	}
+	status := "ok"
+	if !rec.Success || rec.Error != "" {
+		status = "failed"
+	}
+	fmt.Fprintf(w, "\n[%d] %s %s | %s | id=%s | ~%d tokens | talk=%s\n",
+		index+1,
+		when,
+		status,
+		formatHistoryRecordStreams(rec),
+		persist.RecordMessageID(rec),
+		estimateTokens(rec.Transcript),
+		formatDurationShort(time.Duration(rec.AudioMs)*time.Millisecond),
+	)
+	if rec.Stage != "" {
+		fmt.Fprintf(w, "    stage: %s\n", rec.Stage)
+	}
+	if rec.Error != "" {
+		fmt.Fprintf(w, "    error: %s\n", rec.Error)
+	}
+	if rec.FixedFrom != "" && rec.FixedTo != "" {
+		fmt.Fprintf(w, "    fixed: %s -> %s\n", rec.FixedFrom, rec.FixedTo)
+	}
+	text := strings.TrimRight(rec.Transcript, "\r\n")
+	if strings.TrimSpace(text) == "" {
+		text = "(empty transcript)"
+	}
+	for _, line := range strings.Split(text, "\n") {
+		fmt.Fprintf(w, "    %s\n", line)
+	}
+}
+
+func printHistoryListPorcelain(w io.Writer, records []persist.Record, opts historyListOptions) {
+	fmt.Fprintf(w, "history version=1 count=%d offset=%d limit=%d stream=%s newest_last=true\n",
+		len(records),
+		opts.Offset,
+		opts.Limit,
+		porcelainQuote(opts.Stream),
+	)
+	for i, rec := range records {
+		fmt.Fprintf(w, "message index=%d ts=%s stream=%s owned_stream=%s target_type=%s target_ref=%s mode=%s success=%t audio_ms=%d inference_ms=%d tokens=%d error=%s message_id=%s capture_id=%s stage=%s fixed_from=%s fixed_to=%s text=%s\n",
+			i,
+			porcelainTime(rec.Timestamp),
+			porcelainQuote(rec.TargetStream),
+			porcelainQuote(rec.OwnedStream),
+			porcelainQuote(rec.TargetType),
+			porcelainQuote(rec.TargetRef),
+			porcelainQuote(rec.Mode),
+			rec.Success,
+			rec.AudioMs,
+			rec.InferenceMs,
+			estimateTokens(rec.Transcript),
+			porcelainQuote(rec.Error),
+			porcelainQuote(persist.RecordMessageID(rec)),
+			porcelainQuote(rec.CaptureID),
+			porcelainQuote(rec.Stage),
+			porcelainQuote(rec.FixedFrom),
+			porcelainQuote(rec.FixedTo),
+			porcelainQuote(rec.Transcript),
+		)
+	}
+}
+
+func historyListStreamSuffix(stream string) string {
+	if stream == "" {
+		return ""
+	}
+	return fmt.Sprintf(" for stream %q", stream)
+}
+
+func formatHistoryRecordStreams(rec persist.Record) string {
+	owned := rec.OwnedStream
+	if owned == "" {
+		owned = rec.TargetStream
+	}
+	if owned == "" {
+		owned = "-"
+	}
+	if rec.TargetStream == "" || rec.TargetStream == owned {
+		return "stream=" + owned
+	}
+	return fmt.Sprintf("stream=%s original=%s", owned, rec.TargetStream)
 }
 
 func historyPruneCmd() *cobra.Command {

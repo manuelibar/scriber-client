@@ -16,6 +16,8 @@ type Hotkey struct {
 	CycleKey          string `yaml:"cycle_key"`
 	CancelKey         string `yaml:"cancel_key"`
 	QueryKey          string `yaml:"query_key"`
+	FinalizeKey       string `yaml:"finalize_key"`
+	CommandKey        string `yaml:"command_key"`
 	HoldThresholdMs   int    `yaml:"hold_threshold_ms"`
 	DoubleTapWindowMs int    `yaml:"double_tap_window_ms"`
 }
@@ -40,12 +42,19 @@ type UI struct {
 	Notifications bool `yaml:"notifications"`
 }
 
+type CommandMode struct {
+	CodexCommand string `yaml:"codex_command"`
+	CodexModel   string `yaml:"codex_model,omitempty"`
+	TimeoutMs    int    `yaml:"timeout_ms"`
+}
+
 type Config struct {
-	Hotkey  Hotkey  `yaml:"hotkey"`
-	Audio   Audio   `yaml:"audio"`
-	Server  Server  `yaml:"server"`
-	Storage Storage `yaml:"storage"`
-	UI      UI      `yaml:"ui"`
+	Hotkey  Hotkey      `yaml:"hotkey"`
+	Audio   Audio       `yaml:"audio"`
+	Server  Server      `yaml:"server"`
+	Storage Storage     `yaml:"storage"`
+	UI      UI          `yaml:"ui"`
+	Command CommandMode `yaml:"command_mode"`
 }
 
 const MinHoldThresholdMs = 1000
@@ -60,6 +69,8 @@ func Defaults() *Config {
 			CycleKey:          "KEY_RIGHTMETA",
 			CancelKey:         "KEY_ESC",
 			QueryKey:          "KEY_SLASH",
+			FinalizeKey:       "KEY_ENTER",
+			CommandKey:        "KEY_M",
 			HoldThresholdMs:   MinHoldThresholdMs,
 			DoubleTapWindowMs: 300,
 		},
@@ -78,6 +89,10 @@ func Defaults() *Config {
 		UI: UI{
 			Beeps:         true,
 			Notifications: true,
+		},
+		Command: CommandMode{
+			CodexCommand: "codex",
+			TimeoutMs:    60000,
 		},
 	}
 }
@@ -113,6 +128,12 @@ func Load(path string) (*Config, error) {
 func (c *Config) Normalize() {
 	if c.Hotkey.HoldThresholdMs < MinHoldThresholdMs {
 		c.Hotkey.HoldThresholdMs = MinHoldThresholdMs
+	}
+	if c.Command.CodexCommand == "" {
+		c.Command.CodexCommand = "codex"
+	}
+	if c.Command.TimeoutMs <= 0 {
+		c.Command.TimeoutMs = 60000
 	}
 }
 

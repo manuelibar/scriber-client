@@ -1,6 +1,6 @@
 # scriber-client (`stt`)
 
-Go daemon + CLI for terminal-first STT. It listens on a global hotkey, captures mic audio, sends it to `scriber-server`, and routes the final transcript to the selected stream. Streams are STT-owned PTY sessions with slot IDs and optional human names, so no terminal multiplexer is required.
+Go daemon + CLI for terminal-first STT. It listens on a global hotkey, captures mic audio, sends it to `scriber-server`, streams each checkpoint into the selected PTY, and keeps a hidden persisted buffer for Codex finalization. Streams are STT-owned PTY sessions with slot IDs and optional human names, so no terminal multiplexer is required.
 
 Every capture is saved as diagnostic WAV/JSON data. The default directory is `~/.local/state/stt/transcripts/`; do not point it at the repo root except for a temporary debug run.
 
@@ -48,16 +48,18 @@ stt start                  # start Docker backend and host daemon
 stt shutdown               # gracefully stop daemon and Docker backend
 stt daemon [--transcripts-dir DIR]
 stt attach [NAME]         # start an STT-managed terminal stream and select it
+stt attach --language es notes
 stt attach [NAME] -- codex # run a command inside the managed terminal
 stt detach NAME|SLOT      # remove a stream by name or slot number
 stt stream set-slot NAME N
 stt stream clear-slot NAME
-stt select NAME           # select the one stream that receives final text
+stt select NAME           # select the one stream that receives staged text
 stt cycle                 # rotate selection to next live stream
-stt paste [N]             # paste the last N non-empty transcripts; default 1
-stt redeem --from A --to B --last N
+stt paste [N]             # stage the last N visible owned transcripts; default 1
+stt fix --from A --to B --last N
+stt history ls [STREAM]   # list recent owned transcript messages
 stt history prune         # preview and delete transcript history after confirmation
-stt monitor               # live daemon state, streams, selected target, session history, and audio level
+stt monitor               # live daemon dashboard, streams, selected target, and audio level
 stt monitor --once        # print one combined snapshot and exit
 stt doctor                # diagnose setup
 ```
@@ -73,6 +75,8 @@ hotkey:
   cycle_key: KEY_RIGHTMETA
   cancel_key: KEY_ESC
   query_key: KEY_SLASH
+  finalize_key: KEY_ENTER
+  command_key: KEY_M
   hold_threshold_ms: 1000
   double_tap_window_ms: 300
 
@@ -91,7 +95,15 @@ ui:
 storage:
   transcripts_dir: ~/.local/state/stt/transcripts
   registry_path: ~/.local/state/stt/registry.json
+
+command_mode:
+  codex_command: codex
+  timeout_ms: 60000
 ```
+
+The `command_mode` Codex settings also configure buffer finalization, where
+chronological checkpoints are rewritten into clean visible text before the
+finalized buffer is pasted.
 
 ## Stream workflow
 
@@ -119,27 +131,60 @@ stt select codex-main
 stt detach 2
 ```
 
-Only the selected stream receives final text when recording stops. Scriber/STT never presses Enter; review before submitting.
+Only the selected stream receives checkpoint text when recording stops. Each checkpoint is streamed immediately with a trailing space and appended to that stream's hidden buffer. Press right-Ctrl + Enter to run a headless `codex exec` finalization pass and persist the cleaned buffer text to visible history. Tap Enter a second time while still holding right-Ctrl to paste that finalized text into the stream's PTY.
 
-To replay recent dictation into the selected stream:
+Attach a stream with a language when that destination should transcribe in a
+specific language. Locale values are normalized to Whisper language codes, so
+`es-ES`, `es_AR`, and `es` all become `es`.
 
 ```bash
-stt paste      # paste the latest non-empty transcript
-stt paste 3    # paste the last 3, oldest-to-newest, separated by spaces
+stt attach --language es-ES messages
+stt attach --language en-US codex-main
+stt attach --language auto scratch
 ```
+
+Press right-Ctrl + M to toggle command mode. While command mode is on, normal
+speech captures are transcribed as management commands for the selected stream's
+buffer instead of new dictated text. The daemon runs a bounded headless
+`codex exec` call to edit that persisted buffer, so commands like "delete the
+last sentence" or "fix wrd to word" apply before the next finalization.
+
+To stage recent visible dictation into the selected stream buffer:
+
+```bash
+stt paste      # stage the latest non-empty transcript
+stt paste 3    # stage the last 3, oldest-to-newest, separated by spaces
+```
+
+Raw checkpoint diagnostics are not selected by `stt paste`, `stt history ls`, or
+the monitor history window.
 
 To move the last delivered messages from one stream's history to another and
-paste that text into the destination stream:
+stage that text in the destination stream buffer:
 
 ```bash
-stt redeem --from notes --to codex-main --last 3
-stt redeem --to codex-main --last 1   # --from defaults visibly to the active stream
+stt fix --from notes --to codex-main --last 3
+stt fix --to codex-main --last 1   # --from defaults visibly to the active stream
 ```
 
-Redemption updates transcript history ownership and pastes into the destination
-PTY. It does not try to remove text that was already pasted into the source PTY.
+Fixing updates transcript history ownership and stages text in the
+destination buffer. It does not try to remove text that was already streamed into
+the source PTY.
 
-`stt monitor` starts its transcript history at monitor launch, keeps the stats/stream header visible, and stacks a sliding history window under each attached terminal. Entries are separated by dashed timestamp/status lines. Use `stt monitor --history-limit 20` to keep only 20 session records, `--history-limit 0` to hide history, or `--history-stream NAME` to show one stream's session history.
+To inspect persisted message ownership without needing the daemon:
+
+```bash
+stt history ls
+stt history ls codex-main --limit 10
+stt history ls notes --offset 10 --limit 10
+```
+
+`stt history ls` reads the persisted owned history immediately. `--offset`
+skips newest matching messages first, so `--offset 10 --limit 10` shows the
+next older page. Output is chronological inside each page, with the newest
+message last. Use `--porcelain` for stable quoted lines.
+
+`stt monitor` is dashboard-only by default. Use `stt monitor --history-limit 20` to opt into a small session history window, or `--history-stream NAME` to show one stream's session history.
 
 To prune transcript JSON/WAV history:
 
@@ -154,12 +199,14 @@ Without filters, `stt history prune` targets all transcript history in the confi
 
 ## Hotkey behavior
 
-- Hold the talk key (default `KEY_RIGHTCTRL`) for one second to record; release to transcribe.
+- Hold the talk key (default `KEY_RIGHTCTRL`) for one second to record; release to transcribe and stage text in the selected stream buffer.
 - Double-stroke the talk key to start a locked recording; stroke the talk key again to stop.
 - Press the cancel key (default `KEY_ESC`) to discard the current capture.
 - Tap the cycle key (default `KEY_RIGHTMETA`) to rotate the selected stream.
 - Press right-Ctrl + F1-F9 to select an assigned stream; new streams take the first free slot automatically, and the chord cancels any capture started by that key press.
 - Press right-Ctrl + / to show the selected target as a desktop notification; the chord also cancels any capture started by that key press.
+- Press right-Ctrl + Enter to end and finalize the selected stream's hidden buffer. Tap Enter a second time while still holding right-Ctrl to paste that finalized text. This chord does not submit a newline.
+- Press right-Ctrl + M to toggle command mode; spoken captures then edit the selected stream buffer.
 
 ## Operational checks
 

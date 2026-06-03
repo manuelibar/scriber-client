@@ -25,11 +25,20 @@ func TestDefaultsUseSTTStateNamespace(t *testing.T) {
 	if cfg.Hotkey.QueryKey != "KEY_SLASH" {
 		t.Fatalf("QueryKey = %q, want KEY_SLASH", cfg.Hotkey.QueryKey)
 	}
+	if cfg.Hotkey.FinalizeKey != "KEY_ENTER" {
+		t.Fatalf("FinalizeKey = %q, want KEY_ENTER", cfg.Hotkey.FinalizeKey)
+	}
+	if cfg.Hotkey.CommandKey != "KEY_M" {
+		t.Fatalf("CommandKey = %q, want KEY_M", cfg.Hotkey.CommandKey)
+	}
 	if cfg.Hotkey.HoldThresholdMs != MinHoldThresholdMs {
 		t.Fatalf("HoldThresholdMs = %d, want %d", cfg.Hotkey.HoldThresholdMs, MinHoldThresholdMs)
 	}
 	if cfg.Hotkey.DoubleTapWindowMs != 300 {
 		t.Fatalf("DoubleTapWindowMs = %d, want 300", cfg.Hotkey.DoubleTapWindowMs)
+	}
+	if cfg.Command.CodexCommand != "codex" || cfg.Command.TimeoutMs != 60000 {
+		t.Fatalf("Command = %+v, want codex command and 60000ms timeout", cfg.Command)
 	}
 }
 

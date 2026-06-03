@@ -54,6 +54,9 @@ const (
 	ActionSelectSlot
 	ActionReportActiveStream
 	ActionCycleStream
+	ActionEndBuffer
+	ActionPasteFinalizedBuffer
+	ActionToggleCommandMode
 )
 
 const (
@@ -79,6 +82,12 @@ func (a Action) String() string {
 		return "ReportActiveStream"
 	case ActionCycleStream:
 		return "CycleStream"
+	case ActionEndBuffer:
+		return "EndBuffer"
+	case ActionPasteFinalizedBuffer:
+		return "PasteFinalizedBuffer"
+	case ActionToggleCommandMode:
+		return "ToggleCommandMode"
 	default:
 		return "Unknown"
 	}
@@ -170,6 +179,8 @@ type FSMConfig struct {
 	TalkKey         evdev.EvCode
 	CancelKey       evdev.EvCode
 	QueryKey        evdev.EvCode
+	FinalizeKey     evdev.EvCode
+	CommandKey      evdev.EvCode
 	CycleKey        evdev.EvCode
 	SlotKeys        map[evdev.EvCode]int
 }
@@ -194,6 +205,8 @@ func RunRecognizer(ctx context.Context, cfg FSMConfig, events <-chan Event, out 
 	cycleDown := false
 	suppressTalkUp := false
 	chordHandled := false
+	finalizeChordActive := false
+	finalizeKeyDown := false
 
 	var holdTimer, lockTimer *time.Timer
 	var holdC, lockC <-chan time.Time
@@ -296,6 +309,40 @@ func RunRecognizer(ctx context.Context, cfg FSMConfig, events <-chan Event, out 
 				}
 				continue
 			}
+			if cfg.FinalizeKey != 0 && ev.Code == cfg.FinalizeKey && talkDown {
+				if ev.Kind == KeyUp {
+					finalizeKeyDown = false
+					continue
+				}
+				if ev.Kind == KeyDown && !finalizeKeyDown {
+					finalizeKeyDown = true
+					if !chordHandled && state == StatePress1Down {
+						finalizeChordActive = true
+						if !emitChord(ActionEndBuffer, 0, ev.At) {
+							return
+						}
+					} else if finalizeChordActive {
+						if !emit(Command{Action: ActionPasteFinalizedBuffer, At: ev.At}) {
+							return
+						}
+					}
+				}
+				if ev.Kind == KeyDown {
+					continue
+				}
+			}
+			if cfg.FinalizeKey != 0 && ev.Code == cfg.FinalizeKey && ev.Kind == KeyUp {
+				finalizeKeyDown = false
+				continue
+			}
+			if cfg.CommandKey != 0 && ev.Code == cfg.CommandKey && ev.Kind == KeyDown && talkDown {
+				if !chordHandled && state == StatePress1Down {
+					if !emitChord(ActionToggleCommandMode, 0, ev.At) {
+						return
+					}
+				}
+				continue
+			}
 			if slot, ok := cfg.SlotKeys[ev.Code]; ok && ev.Kind == KeyDown && talkDown {
 				if !chordHandled && state == StatePress1Down {
 					if !emitChord(ActionSelectSlot, slot, ev.At) {
@@ -314,6 +361,8 @@ func RunRecognizer(ctx context.Context, cfg FSMConfig, events <-chan Event, out 
 				}
 				talkDown = true
 				chordHandled = false
+				finalizeChordActive = false
+				finalizeKeyDown = false
 				if !apply(decide(state, InKeyDown), ev.At) {
 					return
 				}
@@ -323,6 +372,8 @@ func RunRecognizer(ctx context.Context, cfg FSMConfig, events <-chan Event, out 
 				}
 				talkDown = false
 				chordHandled = false
+				finalizeChordActive = false
+				finalizeKeyDown = false
 				if suppressTalkUp {
 					suppressTalkUp = false
 					continue

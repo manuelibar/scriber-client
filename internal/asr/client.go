@@ -11,10 +11,11 @@ import (
 )
 
 type Result struct {
-	Text    string `json:"text"`
-	Raw     string `json:"raw"`
-	Ms      int    `json:"ms"`
-	AudioMs int    `json:"audio_ms"`
+	Text     string `json:"text"`
+	Raw      string `json:"raw"`
+	Ms       int    `json:"ms"`
+	AudioMs  int    `json:"audio_ms"`
+	Language string `json:"language,omitempty"`
 }
 
 type Client struct {
@@ -47,13 +48,16 @@ func (c *Client) Healthz(ctx context.Context) error {
 }
 
 // Transcribe POSTs raw int16 LE PCM samples and returns the result.
-func (c *Client) Transcribe(ctx context.Context, pcm []byte, sampleRate int) (*Result, error) {
+func (c *Client) Transcribe(ctx context.Context, pcm []byte, sampleRate int, language string) (*Result, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/transcribe", bytes.NewReader(pcm))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("X-Sample-Rate", strconv.Itoa(sampleRate))
+	if language != "" {
+		req.Header.Set("X-Language", language)
+	}
 
 	resp, err := c.hc.Do(req)
 	if err != nil {
