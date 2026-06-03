@@ -85,7 +85,7 @@ func TestGestureRecognizerFinalizeKeyChordSuppressesTalkKeyRelease(t *testing.T)
 
 	now := time.Now()
 	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
-	in <- Event{Kind: KeyDown, Code: evdev.KEY_FN, At: now.Add(time.Millisecond)}
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTSHIFT, At: now.Add(time.Millisecond)}
 	got := readCommand(t, out)
 	if got.Action != ActionEndBuffer {
 		t.Fatalf("finalize-key chord command = %s, want EndBuffer", got.Action)
@@ -100,13 +100,13 @@ func TestGestureRecognizerDoubleFinalizeKeyChordEndsThenPastesFinalizedBuffer(t 
 
 	now := time.Now()
 	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
-	in <- Event{Kind: KeyDown, Code: evdev.KEY_FN, At: now.Add(time.Millisecond)}
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTSHIFT, At: now.Add(time.Millisecond)}
 	got := readCommand(t, out)
 	if got.Action != ActionEndBuffer {
 		t.Fatalf("first finalize-key command = %s, want EndBuffer", got.Action)
 	}
-	in <- Event{Kind: KeyUp, Code: evdev.KEY_FN, At: now.Add(2 * time.Millisecond)}
-	in <- Event{Kind: KeyDown, Code: evdev.KEY_FN, At: now.Add(3 * time.Millisecond)}
+	in <- Event{Kind: KeyUp, Code: evdev.KEY_RIGHTSHIFT, At: now.Add(2 * time.Millisecond)}
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTSHIFT, At: now.Add(3 * time.Millisecond)}
 	got = readCommand(t, out)
 	if got.Action != ActionPasteFinalizedBuffer {
 		t.Fatalf("second finalize-key command = %s, want PasteFinalizedBuffer", got.Action)
@@ -160,7 +160,7 @@ func startTestRecognizer(t *testing.T) (chan Event, chan Command, func()) {
 		TalkKey:         evdev.KEY_RIGHTCTRL,
 		CancelKey:       evdev.KEY_ESC,
 		QueryKey:        evdev.KEY_SLASH,
-		FinalizeKey:     evdev.KEY_FN,
+		FinalizeKey:     evdev.KEY_RIGHTSHIFT,
 		CommandKey:      evdev.KEY_M,
 		CycleKey:        evdev.KEY_RIGHTMETA,
 		SlotKeys:        DefaultSlotKeys(),

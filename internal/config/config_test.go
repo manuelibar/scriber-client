@@ -25,8 +25,8 @@ func TestDefaultsUseSTTStateNamespace(t *testing.T) {
 	if cfg.Hotkey.QueryKey != "KEY_SLASH" {
 		t.Fatalf("QueryKey = %q, want KEY_SLASH", cfg.Hotkey.QueryKey)
 	}
-	if cfg.Hotkey.FinalizeKey != "KEY_FN" {
-		t.Fatalf("FinalizeKey = %q, want KEY_FN", cfg.Hotkey.FinalizeKey)
+	if cfg.Hotkey.FinalizeKey != "KEY_RIGHTSHIFT" {
+		t.Fatalf("FinalizeKey = %q, want KEY_RIGHTSHIFT", cfg.Hotkey.FinalizeKey)
 	}
 	if cfg.Hotkey.CommandKey != "KEY_M" {
 		t.Fatalf("CommandKey = %q, want KEY_M", cfg.Hotkey.CommandKey)

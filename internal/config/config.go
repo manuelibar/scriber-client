@@ -69,7 +69,7 @@ func Defaults() *Config {
 			CycleKey:          "KEY_RIGHTMETA",
 			CancelKey:         "KEY_ESC",
 			QueryKey:          "KEY_SLASH",
-			FinalizeKey:       "KEY_FN",
+			FinalizeKey:       "KEY_RIGHTSHIFT",
 			CommandKey:        "KEY_M",
 			HoldThresholdMs:   MinHoldThresholdMs,
 			DoubleTapWindowMs: 300,

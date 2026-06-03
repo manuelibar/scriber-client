@@ -75,7 +75,7 @@ hotkey:
   cycle_key: KEY_RIGHTMETA
   cancel_key: KEY_ESC
   query_key: KEY_SLASH
-  finalize_key: KEY_FN
+  finalize_key: KEY_RIGHTSHIFT
   command_key: KEY_M
   hold_threshold_ms: 1000
   double_tap_window_ms: 300
@@ -131,7 +131,7 @@ stt select codex-main
 stt detach 2
 ```
 
-Only the selected stream receives checkpoint text when recording stops. Each checkpoint is streamed immediately with a trailing space and appended to that stream's hidden buffer. Press right-Ctrl + Fn to run a headless `codex exec` finalization pass and persist the cleaned buffer text to visible history. Tap Fn a second time while still holding right-Ctrl to paste that finalized text into the stream's PTY.
+Only the selected stream receives checkpoint text when recording stops. Each checkpoint is streamed immediately with a trailing space and appended to that stream's hidden buffer. Press right-Ctrl + right-Shift to run a headless `codex exec` finalization pass and persist the cleaned buffer text to visible history. Tap right-Shift a second time while still holding right-Ctrl to paste that finalized text into the stream's PTY.
 
 Attach a stream with a language when that destination should transcribe in a
 specific language. Locale values are normalized to Whisper language codes, so
@@ -205,7 +205,7 @@ Without filters, `stt history prune` targets all transcript history in the confi
 - Tap the cycle key (default `KEY_RIGHTMETA`) to rotate the selected stream.
 - Press right-Ctrl + F1-F9 to select an assigned stream; new streams take the first free slot automatically, and the chord cancels any capture started by that key press.
 - Press right-Ctrl + / to show the selected target as a desktop notification; the chord also cancels any capture started by that key press.
-- Press right-Ctrl + Fn to end and finalize the selected stream's hidden buffer. Tap Fn a second time while still holding right-Ctrl to paste that finalized text. This chord does not submit a newline.
+- Press right-Ctrl + right-Shift to end and finalize the selected stream's hidden buffer. Tap right-Shift a second time while still holding right-Ctrl to paste that finalized text. This chord does not submit a newline.
 - Press right-Ctrl + M to toggle command mode; spoken captures then edit the selected stream buffer.
 
 ## Operational checks
