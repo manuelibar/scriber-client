@@ -1,6 +1,6 @@
 # scriber-client (`stt`)
 
-Go daemon + CLI for terminal-first STT. It listens on a global hotkey, captures mic audio, sends it to `scriber-server`, streams each checkpoint into the selected PTY, and keeps a hidden persisted buffer for Codex finalization. Streams are STT-owned PTY sessions with slot IDs and optional human names, so no terminal multiplexer is required.
+Go daemon + CLI for terminal-first STT. It listens on a global hotkey, captures mic audio, sends it to `scriber-server`, and injects each completed speech capture into the selected PTY. Streams are STT-owned PTY sessions with slot IDs and optional human names, so no terminal multiplexer is required.
 
 Every capture is saved as diagnostic WAV/JSON data. The default directory is `~/.local/state/stt/transcripts/`; do not point it at the repo root except for a temporary debug run.
 
@@ -53,9 +53,9 @@ stt attach [NAME] -- codex # run a command inside the managed terminal
 stt detach NAME|SLOT      # remove a stream by name or slot number
 stt stream set-slot NAME N
 stt stream clear-slot NAME
-stt select NAME           # select the one stream that receives staged text
+stt select NAME           # select the one stream that receives dictated text
 stt cycle                 # rotate selection to next live stream
-stt paste [N]             # stage the last N visible owned transcripts; default 1
+stt paste [N]             # inject the last N visible owned transcripts; default 1
 stt fix --from A --to B --last N
 stt history ls [STREAM]   # list recent owned transcript messages
 stt history prune         # preview and delete transcript history after confirmation
@@ -75,8 +75,6 @@ hotkey:
   cycle_key: KEY_RIGHTMETA
   cancel_key: KEY_ESC
   query_key: KEY_SLASH
-  finalize_key: KEY_RIGHTSHIFT
-  command_key: KEY_M
   hold_threshold_ms: 1000
   double_tap_window_ms: 300
 
@@ -86,7 +84,7 @@ audio:
 
 server:
   url: http://127.0.0.1:8765
-  timeout_ms: 5000
+  timeout_ms: 30000
 
 ui:
   beeps: false
@@ -95,15 +93,10 @@ ui:
 storage:
   transcripts_dir: ~/.local/state/stt/transcripts
   registry_path: ~/.local/state/stt/registry.json
-
-command_mode:
-  codex_command: codex
-  timeout_ms: 60000
 ```
 
-The `command_mode` Codex settings also configure buffer finalization, where
-chronological checkpoints are rewritten into clean visible text before the
-finalized buffer is pasted.
+Server timeouts below 30 seconds are clamped to 30 seconds. Long captures get a
+larger per-capture transcription timeout based on the audio duration.
 
 ## Stream workflow
 
@@ -131,7 +124,7 @@ stt select codex-main
 stt detach 2
 ```
 
-Only the selected stream receives checkpoint text when recording stops. Each checkpoint is streamed immediately with a trailing space and appended to that stream's hidden buffer. Press right-Ctrl + right-Shift to run a headless `codex exec` finalization pass and persist the cleaned buffer text to visible history. Tap right-Shift a second time while still holding right-Ctrl to paste that finalized text into the stream's PTY.
+Only the selected stream receives dictated text when recording stops. Each completed capture is injected immediately with a trailing space and saved to visible transcript history. Captures are independent; the daemon does not join them into a hidden text buffer and does not call Codex to rewrite them.
 
 Attach a stream with a language when that destination should transcribe in a
 specific language. Locale values are normalized to Whisper language codes, so
@@ -143,32 +136,23 @@ stt attach --language en-US codex-main
 stt attach --language auto scratch
 ```
 
-Press right-Ctrl + M to toggle command mode. While command mode is on, normal
-speech captures are transcribed as management commands for the selected stream's
-buffer instead of new dictated text. The daemon runs a bounded headless
-`codex exec` call to edit that persisted buffer, so commands like "delete the
-last sentence" or "fix wrd to word" apply before the next finalization.
-
-To stage recent visible dictation into the selected stream buffer:
+To inject recent visible dictation into the selected stream:
 
 ```bash
-stt paste      # stage the latest non-empty transcript
-stt paste 3    # stage the last 3, oldest-to-newest, separated by spaces
+stt paste      # inject the latest non-empty transcript
+stt paste 3    # inject the last 3, oldest-to-newest, separated by spaces
 ```
 
-Raw checkpoint diagnostics are not selected by `stt paste`, `stt history ls`, or
-the monitor history window.
-
 To move the last visible owned messages from one stream's history to another
-and stage that text in the destination stream buffer:
+and inject that text into the destination stream:
 
 ```bash
 stt fix --from notes --to codex-main --last 3
 stt fix --to codex-main --last 1   # --from defaults visibly to the active stream
 ```
 
-Fixing updates transcript history ownership and stages text in the
-destination buffer. It does not try to remove text that was already streamed into
+Fixing updates transcript history ownership and injects text into the
+destination stream. It does not try to remove text that was already streamed into
 the source PTY.
 
 To inspect persisted message ownership without needing the daemon:
@@ -199,14 +183,12 @@ Without filters, `stt history prune` targets all transcript history in the confi
 
 ## Hotkey behavior
 
-- Hold the talk key (default `KEY_RIGHTCTRL`) for one second to record; release to transcribe and stage text in the selected stream buffer.
+- Hold the talk key (default `KEY_RIGHTCTRL`) for one second to record; release to transcribe and inject text into the selected stream.
 - Double-stroke the talk key to start a locked recording; stroke the talk key again to stop.
 - Press the cancel key (default `KEY_ESC`) to discard the current capture.
 - Tap the cycle key (default `KEY_RIGHTMETA`) to rotate the selected stream.
 - Press right-Ctrl + F1-F9 to select an assigned stream; new streams take the first free slot automatically, and the chord cancels any capture started by that key press.
 - Press right-Ctrl + / to show the selected target as a desktop notification; the chord also cancels any capture started by that key press.
-- Press right-Ctrl + right-Shift to end and finalize the selected stream's hidden buffer. Tap right-Shift a second time while still holding right-Ctrl to paste that finalized text. This chord does not submit a newline.
-- Press right-Ctrl + M to toggle command mode; spoken captures then edit the selected stream buffer.
 
 ## Operational checks
 

@@ -12,8 +12,8 @@ const (
 
 // Target is the concrete STT-owned endpoint attached to a logical stream.
 // For the terminal backend, TargetRef is a private Unix socket served by
-// `stt attach`; checkpoint streaming and finalized-buffer paste POST text
-// there, and the attach process writes it into the PTY master it owns.
+// `stt attach`; dictation and explicit paste requests POST text there, and the
+// attach process writes it into the PTY master it owns.
 type Target struct {
 	ID         string    `json:"id"`
 	StreamID   string    `json:"stream_id"`
@@ -27,7 +27,7 @@ type Target struct {
 	LastSeenAt time.Time `json:"last_seen_at"`
 }
 
-// Stream is the user-facing destination for checkpoint and finalized text.
+// Stream is the user-facing destination for dictated text.
 type Stream struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name,omitempty"`

@@ -115,25 +115,17 @@ func TestFixMovesOwnershipWithAppendOnlyRecord(t *testing.T) {
 	}
 }
 
-func TestCaptureStoreRecoverCommandCaptureQueuesCommand(t *testing.T) {
+func TestCaptureStoreRecoverIgnoresTerminalFailedCaptures(t *testing.T) {
 	store := NewCaptureStore(t.TempDir())
-	writer, err := store.NewCaptureWithOptions(16000, CaptureOptions{
-		Kind:         CaptureKindCommand,
-		TargetStream: "codex",
-	})
+	writer, err := store.NewCapture(16000)
 	if err != nil {
-		t.Fatalf("NewCaptureWithOptions() error = %v", err)
+		t.Fatalf("NewCapture() error = %v", err)
 	}
 	meta, err := writer.FinalizeWithPCM(make([]byte, 320))
 	if err != nil {
 		t.Fatalf("FinalizeWithPCM() error = %v", err)
 	}
-	if _, err := store.Update(meta.CaptureID, func(next *CaptureMeta) {
-		next.Kind = CaptureKindCommand
-		next.Stage = StageTranscribed
-		next.TargetStream = "codex"
-		next.Transcript = "delete last staged sentence"
-	}); err != nil {
+	if _, err := store.Fail(meta.CaptureID, StageTranscribing, os.ErrDeadlineExceeded, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -141,8 +133,11 @@ func TestCaptureStoreRecoverCommandCaptureQueuesCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recover() error = %v", err)
 	}
-	if len(plan.Command) != 1 || plan.Command[0].Stage != StageQueuedForCommand || plan.Command[0].TargetStream != "codex" {
-		t.Fatalf("command recovery = %+v, want one queued command capture", plan.Command)
+	if len(plan.Failed) != 0 {
+		t.Fatalf("failed recovery = %+v, want none", plan.Failed)
+	}
+	if len(plan.ASR) != 0 {
+		t.Fatalf("ASR recovery = %+v, want none", plan.ASR)
 	}
 	if len(plan.Delivery) != 0 {
 		t.Fatalf("delivery recovery = %+v, want none", plan.Delivery)

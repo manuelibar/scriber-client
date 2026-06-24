@@ -25,26 +25,20 @@ func TestDefaultsUseSTTStateNamespace(t *testing.T) {
 	if cfg.Hotkey.QueryKey != "KEY_SLASH" {
 		t.Fatalf("QueryKey = %q, want KEY_SLASH", cfg.Hotkey.QueryKey)
 	}
-	if cfg.Hotkey.FinalizeKey != "KEY_RIGHTSHIFT" {
-		t.Fatalf("FinalizeKey = %q, want KEY_RIGHTSHIFT", cfg.Hotkey.FinalizeKey)
-	}
-	if cfg.Hotkey.CommandKey != "KEY_M" {
-		t.Fatalf("CommandKey = %q, want KEY_M", cfg.Hotkey.CommandKey)
-	}
 	if cfg.Hotkey.HoldThresholdMs != MinHoldThresholdMs {
 		t.Fatalf("HoldThresholdMs = %d, want %d", cfg.Hotkey.HoldThresholdMs, MinHoldThresholdMs)
 	}
 	if cfg.Hotkey.DoubleTapWindowMs != 300 {
 		t.Fatalf("DoubleTapWindowMs = %d, want 300", cfg.Hotkey.DoubleTapWindowMs)
 	}
-	if cfg.Command.CodexCommand != "codex" || cfg.Command.TimeoutMs != 60000 {
-		t.Fatalf("Command = %+v, want codex command and 60000ms timeout", cfg.Command)
+	if cfg.Server.TimeoutMs != MinServerTimeoutMs {
+		t.Fatalf("Server.TimeoutMs = %d, want %d", cfg.Server.TimeoutMs, MinServerTimeoutMs)
 	}
 }
 
-func TestLoadClampsHoldThreshold(t *testing.T) {
+func TestLoadClampsThresholds(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.yml")
-	if err := os.WriteFile(path, []byte("hotkey:\n  hold_threshold_ms: 180\n"), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte("hotkey:\n  hold_threshold_ms: 180\nserver:\n  timeout_ms: 5000\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := Load(path)
@@ -53,6 +47,9 @@ func TestLoadClampsHoldThreshold(t *testing.T) {
 	}
 	if cfg.Hotkey.HoldThresholdMs != MinHoldThresholdMs {
 		t.Fatalf("HoldThresholdMs = %d, want %d", cfg.Hotkey.HoldThresholdMs, MinHoldThresholdMs)
+	}
+	if cfg.Server.TimeoutMs != MinServerTimeoutMs {
+		t.Fatalf("Server.TimeoutMs = %d, want %d", cfg.Server.TimeoutMs, MinServerTimeoutMs)
 	}
 }
 

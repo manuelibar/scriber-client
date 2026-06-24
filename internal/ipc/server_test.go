@@ -12,7 +12,7 @@ import (
 	"scriber/internal/persist"
 )
 
-func TestHandleFixStagesDestinationBufferAndMovesHistoryOwnership(t *testing.T) {
+func TestHandleFixInjectsDestinationStreamAndMovesHistoryOwnership(t *testing.T) {
 	dir := t.TempDir()
 	base := time.Date(2026, 5, 29, 12, 0, 0, 0, time.UTC)
 	for _, rec := range []persist.Record{
@@ -37,12 +37,8 @@ func TestHandleFixStagesDestinationBufferAndMovesHistoryOwnership(t *testing.T) 
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s, want 200", recorder.Code, recorder.Body.String())
 	}
-	buffer, err := persist.NewBufferStore(dir).Read("codex-main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(buffer.Entries) != 1 || buffer.Entries[0].Text != "one\ntwo" {
-		t.Fatalf("buffer entries = %+v, want fixed text staged", buffer.Entries)
+	if reg.sentStream != "codex-main" || reg.sentText != "one\ntwo" {
+		t.Fatalf("sent stream=%q text=%q, want fixed text injected into codex-main", reg.sentStream, reg.sentText)
 	}
 	notes, err := persist.QueryOwnedHistory(dir, persist.HistoryQuery{Stream: "notes"})
 	if err != nil {
@@ -73,7 +69,7 @@ func TestServerDoesNotExposeFixCompatibilityRoutes(t *testing.T) {
 	}
 }
 
-func TestHandlePasteStagesActiveBuffer(t *testing.T) {
+func TestHandlePasteInjectsActiveStream(t *testing.T) {
 	dir := t.TempDir()
 	reg := &fakeRegistry{}
 	server := NewServer("", reg, fakeDaemonState{}, nil, dir)
@@ -89,12 +85,8 @@ func TestHandlePasteStagesActiveBuffer(t *testing.T) {
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s, want 200", recorder.Code, recorder.Body.String())
 	}
-	buffer, err := persist.NewBufferStore(dir).Read("codex-main")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(buffer.Entries) != 1 || buffer.Entries[0].Text != "paste me" {
-		t.Fatalf("buffer entries = %+v, want pasted text staged", buffer.Entries)
+	if reg.sentStream != "codex-main" || reg.sentText != "paste me" {
+		t.Fatalf("sent stream=%q text=%q, want pasted text injected into active stream", reg.sentStream, reg.sentText)
 	}
 }
 

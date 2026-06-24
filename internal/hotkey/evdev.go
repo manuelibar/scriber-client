@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/holoplot/go-evdev"
@@ -36,62 +37,131 @@ type Event struct {
 	At   time.Time
 }
 
-// Listen scans /dev/input/event*, opens every keyboard-capable device, and emits
-// KeyDown/KeyUp events for codes in `watched`. Repeat events (value=2) are dropped.
-// Returns an error if no keyboard devices are accessible (typically: not in input group).
+type inputBackend interface {
+	ListDevicePaths() ([]evdev.InputPath, error)
+	Open(path string) (inputDevice, error)
+}
+
+type inputDevice interface {
+	Close() error
+	Name() (string, error)
+	Path() string
+	CapableTypes() []evdev.EvType
+	CapableEvents(evdev.EvType) []evdev.EvCode
+	ReadOne() (*evdev.InputEvent, error)
+}
+
+type evdevBackend struct{}
+
+func (evdevBackend) ListDevicePaths() ([]evdev.InputPath, error) {
+	return evdev.ListDevicePaths()
+}
+
+func (evdevBackend) Open(path string) (inputDevice, error) {
+	return evdev.OpenWithFlags(path, os.O_RDONLY)
+}
+
+const deviceScanInterval = 2 * time.Second
+
+// Listen scans /dev/input/event*, opens every device that advertises at least
+// one watched hotkey, and emits KeyDown/KeyUp events for those codes. Repeat
+// events (value=2) are dropped. Devices are rescanned while the listener runs
+// so USB reconnects, sleep/resume, and evdev renumbering do not require a daemon
+// restart.
 func Listen(ctx context.Context, watched map[evdev.EvCode]bool) (<-chan Event, error) {
-	paths, err := evdev.ListDevicePaths()
+	return listenWithBackend(ctx, evdevBackend{}, watched, deviceScanInterval)
+}
+
+func listenWithBackend(ctx context.Context, backend inputBackend, watched map[evdev.EvCode]bool, scanInterval time.Duration) (<-chan Event, error) {
+	paths, err := backend.ListDevicePaths()
 	if err != nil {
 		return nil, fmt.Errorf("list device paths: %w", err)
 	}
 
 	out := make(chan Event, 64)
-	started := 0
-	for _, p := range paths {
-		d, err := evdev.Open(p.Path)
-		if err != nil {
-			continue
+	done := make(chan string, 64)
+	active := map[string]bool{}
+	startDevice := func(p evdev.InputPath) bool {
+		if active[p.Path] {
+			return false
 		}
-		if !isKeyboard(d) {
+		d, err := backend.Open(p.Path)
+		if err != nil {
+			return false
+		}
+		if !isHotkeyDevice(d, watched) {
 			d.Close()
-			continue
+			return false
 		}
 		name, _ := d.Name()
-		slog.Info("watching keyboard", "path", p.Path, "name", name)
-		started++
-		go readDevice(ctx, d, watched, out)
+		slog.Info("watching hotkey device", "path", p.Path, "name", name)
+		active[p.Path] = true
+		go func(path string) {
+			readDevice(ctx, d, watched, out)
+			select {
+			case done <- path:
+			case <-ctx.Done():
+			}
+		}(p.Path)
+		return true
 	}
-	if started == 0 {
-		return nil, fmt.Errorf("no keyboard devices accessible — is your user in the 'input' group? (sudo usermod -aG input $USER && relogin)")
+	scan := func(paths []evdev.InputPath) int {
+		started := 0
+		for _, p := range paths {
+			if startDevice(p) {
+				started++
+			}
+		}
+		return started
 	}
+
+	if scan(paths) == 0 {
+		return nil, fmt.Errorf("no readable input devices advertise the configured hotkeys; check the 'input' group and hotkey config")
+	}
+
+	go func() {
+		ticker := time.NewTicker(scanInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case path := <-done:
+				delete(active, path)
+				paths, err := backend.ListDevicePaths()
+				if err != nil {
+					slog.Warn("evdev rescan failed", "err", err)
+					continue
+				}
+				scan(paths)
+			case <-ticker.C:
+				paths, err := backend.ListDevicePaths()
+				if err != nil {
+					slog.Warn("evdev rescan failed", "err", err)
+					continue
+				}
+				scan(paths)
+			}
+		}
+	}()
 	return out, nil
 }
 
-func isKeyboard(d *evdev.InputDevice) bool {
-	hasKey := false
+func isHotkeyDevice(d inputDevice, watched map[evdev.EvCode]bool) bool {
 	for _, t := range d.CapableTypes() {
 		if t == evdev.EV_KEY {
-			hasKey = true
-			break
+			for _, c := range d.CapableEvents(evdev.EV_KEY) {
+				if watched[c] {
+					return true
+				}
+			}
+			return false
 		}
 	}
-	if !hasKey {
-		return false
-	}
-	// Heuristic: real keyboards expose typical alphabetic key codes.
-	hasA, hasSpace := false, false
-	for _, c := range d.CapableEvents(evdev.EV_KEY) {
-		switch c {
-		case evdev.KEY_A:
-			hasA = true
-		case evdev.KEY_SPACE:
-			hasSpace = true
-		}
-	}
-	return hasA && hasSpace
+	return false
 }
 
-func readDevice(ctx context.Context, d *evdev.InputDevice, watched map[evdev.EvCode]bool, out chan<- Event) {
+func readDevice(ctx context.Context, d inputDevice, watched map[evdev.EvCode]bool, out chan<- Event) {
 	defer d.Close()
 	for {
 		select {
@@ -101,7 +171,9 @@ func readDevice(ctx context.Context, d *evdev.InputDevice, watched map[evdev.EvC
 		}
 		ev, err := d.ReadOne()
 		if err != nil {
-			slog.Warn("evdev read error", "err", err)
+			if ctx.Err() == nil {
+				slog.Warn("evdev read error", "path", d.Path(), "err", err)
+			}
 			return
 		}
 		if ev.Type != evdev.EV_KEY {

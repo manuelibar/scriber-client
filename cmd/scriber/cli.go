@@ -169,7 +169,7 @@ func streamIsActive(s ipc.Stream, active string, activeSlot int) bool {
 func selectCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "select NAME",
-		Short: "Select the one stream that receives staged dictated text",
+		Short: "Select the one stream that receives dictated text",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cli := ipc.NewClient(config.SocketPath())
@@ -204,7 +204,7 @@ func pasteCmd() *cobra.Command {
 	var separator string
 	c := &cobra.Command{
 		Use:   "paste [N]",
-		Short: "Stage recent transcript text in the selected stream buffer",
+		Short: "Inject recent transcript text into the selected stream",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			count := 1
@@ -246,7 +246,7 @@ func pasteCmd() *cobra.Command {
 			if len(records) != 1 {
 				label = "transcripts"
 			}
-			fmt.Printf("staged %d %s in stream %q\n", len(records), label, resp.Stream)
+			fmt.Printf("injected %d %s into stream %q\n", len(records), label, resp.Stream)
 			return nil
 		},
 	}
@@ -262,7 +262,7 @@ func fixCmd() *cobra.Command {
 	var separator string
 	c := &cobra.Command{
 		Use:   "fix --to DEST --last N [--from SOURCE]",
-		Short: "Fix recent transcript ownership and stage it in another stream",
+		Short: "Fix recent transcript ownership and inject it into another stream",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if to == "" {
@@ -295,7 +295,7 @@ func fixCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "fixed %d message(s) from %q to %q and staged %d chars\n", len(resp.MessageIDs), resp.From, resp.To, resp.Chars)
+			fmt.Fprintf(cmd.OutOrStdout(), "fixed %d message(s) from %q to %q and injected %d chars\n", len(resp.MessageIDs), resp.From, resp.To, resp.Chars)
 			return nil
 		},
 	}

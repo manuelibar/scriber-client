@@ -46,7 +46,6 @@ type DaemonState interface {
 type Server struct {
 	socketPath     string
 	transcriptsDir string
-	bufferStore    *persist.BufferStore
 	reg            Registry
 	dmn            DaemonState
 	shutdown       func()
@@ -57,11 +56,7 @@ func NewServer(socketPath string, reg Registry, dmn DaemonState, shutdown func()
 	if len(transcriptsDir) > 0 {
 		dir = transcriptsDir[0]
 	}
-	var bufferStore *persist.BufferStore
-	if dir != "" {
-		bufferStore = persist.NewBufferStore(dir)
-	}
-	return &Server{socketPath: socketPath, transcriptsDir: dir, bufferStore: bufferStore, reg: reg, dmn: dmn, shutdown: shutdown}
+	return &Server{socketPath: socketPath, transcriptsDir: dir, reg: reg, dmn: dmn, shutdown: shutdown}
 }
 
 func (s *Server) Serve(ctx context.Context) error {
@@ -332,7 +327,11 @@ func (s *Server) handlePaste(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	label := serverStreamLabel(*stream)
-	if err := s.stageBuffer(label, *stream, req.Text); err != nil {
+	if strings.TrimSpace(req.Text) == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("text is empty"))
+		return
+	}
+	if _, err := s.reg.SendTextToStream(label, req.Text); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -380,7 +379,7 @@ func (s *Server) handleFix(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if err := s.stageBuffer(serverStreamLabel(*stream), *stream, selection.Text); err != nil {
+	if _, err := s.reg.SendTextToStream(serverStreamLabel(*stream), selection.Text); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -391,20 +390,6 @@ func (s *Server) handleFix(w http.ResponseWriter, r *http.Request) {
 		Chars:      len(selection.Text),
 		Text:       selection.Text,
 	})
-}
-
-func (s *Server) stageBuffer(label string, stream Stream, text string) error {
-	if s.bufferStore == nil {
-		return fmt.Errorf("transcript buffer unavailable")
-	}
-	_, err := s.bufferStore.Append(persist.BufferEntry{
-		Stream:       label,
-		TargetType:   stream.Target.TargetType,
-		TargetRef:    stream.Target.TargetRef,
-		Text:         text,
-		TranscriptAt: time.Now().UTC(),
-	})
-	return err
 }
 
 func serverStreamLabel(stream Stream) string {
