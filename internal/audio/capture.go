@@ -39,12 +39,19 @@ func New(sampleRate int) (*Capture, error) {
 
 func (c *Capture) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.device != nil {
-		_ = c.device.Stop()
-		c.device.Uninit()
-		c.device = nil
+	dev := c.device
+	c.device = nil
+	c.mu.Unlock()
+
+	// Stop outside the lock: device.Stop() waits for in-flight callbacks,
+	// and onRecv acquires c.mu — holding both deadlocks.
+	if dev != nil {
+		_ = dev.Stop()
+		dev.Uninit()
 	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.ctx != nil {
 		_ = c.ctx.Uninit()
 		c.ctx.Free()
@@ -102,16 +109,23 @@ func (c *Capture) StartWithChunks(onChunk func([]byte)) error {
 // Stop ends capture and returns the captured PCM bytes.
 func (c *Capture) Stop() ([]byte, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.capturing {
+		c.mu.Unlock()
 		return nil, fmt.Errorf("not capturing")
 	}
-	_ = c.device.Stop()
-	c.device.Uninit()
+	dev := c.device
 	c.device = nil
 	c.capturing = false
-	c.level = 0
+	c.mu.Unlock()
 
+	// Stop outside the lock: device.Stop() waits for in-flight callbacks,
+	// and onRecv acquires c.mu — holding both deadlocks.
+	_ = dev.Stop()
+	dev.Uninit()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.level = 0
 	out := make([]byte, len(c.buf))
 	copy(out, c.buf)
 	c.buf = c.buf[:0]
@@ -121,14 +135,20 @@ func (c *Capture) Stop() ([]byte, error) {
 // Discard ends capture and throws away the buffer (used when a tap is reclassified).
 func (c *Capture) Discard() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.capturing {
+		c.mu.Unlock()
 		return nil
 	}
-	_ = c.device.Stop()
-	c.device.Uninit()
+	dev := c.device
 	c.device = nil
 	c.capturing = false
+	c.mu.Unlock()
+
+	_ = dev.Stop()
+	dev.Uninit()
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.buf = c.buf[:0]
 	c.level = 0
 	return nil
