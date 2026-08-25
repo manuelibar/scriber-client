@@ -283,6 +283,12 @@ func RunRecognizer(ctx context.Context, cfg FSMConfig, events <-chan Event, out 
 				continue
 			}
 			if ev.Code == cfg.CancelKey && ev.Kind == KeyDown {
+				// In locked capture the talk key is not held, so a bare ESC
+				// (common in editors, browsers, dialogs) would silently discard
+				// minutes of audio.  Require talk+ESC to cancel.
+				if state == StateLockedCapture && !talkDown {
+					continue
+				}
 				if !apply(decide(state, InCancel), ev.At) {
 					return
 				}

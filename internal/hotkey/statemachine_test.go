@@ -98,6 +98,35 @@ func TestGestureRecognizerCancelDiscardsActiveCapture(t *testing.T) {
 	assertNoCommand(t, out, 20*time.Millisecond)
 }
 
+func TestBareEscIgnoredDuringLockedCapture(t *testing.T) {
+	in, out, stop := startTestRecognizer(t)
+	defer stop()
+
+	now := time.Now()
+	// Double-tap to enter locked capture.
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now}
+	in <- Event{Kind: KeyUp, Code: evdev.KEY_RIGHTCTRL, At: now.Add(time.Millisecond)}
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now.Add(2 * time.Millisecond)}
+	in <- Event{Kind: KeyUp, Code: evdev.KEY_RIGHTCTRL, At: now.Add(3 * time.Millisecond)}
+	got := readCommand(t, out)
+	if got.Action != ActionToggleLockedCapture {
+		t.Fatalf("setup: got %s, want ToggleLockedCapture", got.Action)
+	}
+
+	// Bare ESC (talk key not held) must NOT discard — prevents accidental
+	// loss from ESC presses in editors, browsers, etc.
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_ESC, At: now.Add(100 * time.Millisecond)}
+	in <- Event{Kind: KeyUp, Code: evdev.KEY_ESC, At: now.Add(101 * time.Millisecond)}
+	assertNoCommand(t, out, 30*time.Millisecond)
+
+	// Talk key still finalizes the capture normally.
+	in <- Event{Kind: KeyDown, Code: evdev.KEY_RIGHTCTRL, At: now.Add(200 * time.Millisecond)}
+	got = readCommand(t, out)
+	if got.Action != ActionToggleLockedCapture {
+		t.Fatalf("finalize: got %s, want ToggleLockedCapture", got.Action)
+	}
+}
+
 func startTestRecognizer(t *testing.T) (chan Event, chan Command, func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
