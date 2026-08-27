@@ -1,7 +1,6 @@
 package persist
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,7 +125,7 @@ func TestCaptureStoreRecoverIgnoresTerminalFailedCaptures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FinalizeWithPCM() error = %v", err)
 	}
-	if _, err := store.Fail(meta.CaptureID, StageTranscribing, fmt.Errorf("empty text"), false); err != nil {
+	if _, err := store.Fail(meta.CaptureID, StageTranscribing, os.ErrDeadlineExceeded, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -145,28 +144,3 @@ func TestCaptureStoreRecoverIgnoresTerminalFailedCaptures(t *testing.T) {
 	}
 }
 
-func TestCaptureStoreRecoverRetriesRetryableFailedCaptures(t *testing.T) {
-	store := NewCaptureStore(t.TempDir())
-	writer, err := store.NewCapture(16000)
-	if err != nil {
-		t.Fatalf("NewCapture() error = %v", err)
-	}
-	meta, err := writer.FinalizeWithPCM(make([]byte, 320))
-	if err != nil {
-		t.Fatalf("FinalizeWithPCM() error = %v", err)
-	}
-	if _, err := store.Fail(meta.CaptureID, StageTranscribing, os.ErrDeadlineExceeded, true); err != nil {
-		t.Fatal(err)
-	}
-
-	plan, err := store.Recover(2)
-	if err != nil {
-		t.Fatalf("Recover() error = %v", err)
-	}
-	if len(plan.ASR) != 1 {
-		t.Fatalf("ASR recovery count = %d, want 1", len(plan.ASR))
-	}
-	if plan.ASR[0].Stage != StageQueuedForASR {
-		t.Fatalf("recovered stage = %s, want QueuedForASR", plan.ASR[0].Stage)
-	}
-}

@@ -392,34 +392,7 @@ func (s *CaptureStore) Recover(minPCMBytes int64) (RecoveryPlan, error) {
 			}
 			plan.Delivery = append(plan.Delivery, queued)
 		case StageFailed:
-			if !meta.Retryable {
-				continue
-			}
-			if meta.PCMPath == "" && meta.InflightPCMPath == "" {
-				continue
-			}
-			if meta.PCMPath != "" {
-				queued, err := s.Update(meta.CaptureID, func(next *CaptureMeta) {
-					next.Stage = StageQueuedForASR
-					next.Error = ""
-					next.FailedStage = ""
-					next.Retryable = false
-				})
-				if err != nil {
-					return RecoveryPlan{}, err
-				}
-				plan.ASR = append(plan.ASR, queued)
-			} else {
-				recovered, err := s.recoverInflight(meta, minPCMBytes)
-				if err != nil {
-					return RecoveryPlan{}, err
-				}
-				if recovered.Stage == StageFailed {
-					plan.Failed = append(plan.Failed, recovered)
-				} else {
-					plan.ASR = append(plan.ASR, recovered)
-				}
-			}
+			continue
 		}
 	}
 	return plan, nil
